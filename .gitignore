@@ -1,0 +1,5 @@
+data/
+__pycache__/
+.env
+.ruff_cache/
+.DS_Store

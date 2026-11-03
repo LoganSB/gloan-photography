@@ -1,0 +1,6 @@
+data/
+__pycache__/
+.ruff_cache/
+.git/
+.env
+*.md
