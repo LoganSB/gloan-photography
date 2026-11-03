@@ -1,5 +1,7 @@
 # Gloan
 
+This is currently in stage one and is entirely AI generated with only minor human edits. You have been warned.
+
 Landscape and macro photo gallery: static page (`index.html`) plus a small
 standard-library Python backend (`server.py`, no installs needed).
 
