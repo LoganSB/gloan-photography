@@ -38,7 +38,7 @@ LOGGER = logging.getLogger('gloan')
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('GLOAN_DATA', ROOT / 'data'))
 PHOTO_DIR = DATA / 'photos'
-INDEX_FILE = 'photos.json'
+INDEX_FILE = ROOT / 'photos.json'
 
 MIN_PASSWORD = 8
 MAX_STORY = 5000
