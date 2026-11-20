@@ -4,7 +4,13 @@ ENV PYTHONUNBUFFERED=1 \
     GLOAN_DATA=/data
 
 WORKDIR /app
+
+# Pillow is needed only by tools/make_thumbnails.py (the server itself is standard-library-only).
+COPY tools/requirements.txt ./tools/requirements.txt
+RUN pip install --no-cache-dir -r tools/requirements.txt
 COPY server.py index.html ./
+COPY gloan ./gloan
+COPY tools ./tools
 
 # Unprivileged user; /data is where Cloud Run mounts the Cloud Storage bucket.
 RUN useradd --system --uid 10001 gloan && mkdir /data && chown gloan /data

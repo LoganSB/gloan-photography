@@ -71,6 +71,15 @@ header.top{position:sticky;top:0;z-index:20;backdrop-filter:blur(16px);backgroun
 .ov .t{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;transform:translateY(8px);transition:transform .35s .04s}
 .ov .t span{font-size:11px;padding:2px 9px;border-radius:99px;background:rgba(255,255,255,.18);backdrop-filter:blur(6px)}
 .card:hover .ov h3,.card:hover .ov .t{transform:none}
+.ov .addtag{position:absolute;top:10px;right:10px;padding:5px 12px;font-size:12px;background:rgba(0,0,0,.55);color:#fff;border-color:rgba(255,255,255,.25)}
+.card:not(.loaded){min-height:180px} /* placeholder until its image has been fetched */
+.card img:not([src]){visibility:hidden}
+.pager{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;align-items:center;padding:0 0 70px}
+.pager .btn{min-width:38px;justify-content:center;padding:7px 12px}
+.pager .btn.on{background:var(--accent);color:var(--accent-ink)}
+.pager .btn:disabled{opacity:.35;cursor:default}
+.pager .info{flex-basis:100%;text-align:center;color:var(--muted);font-size:12.5px;margin-bottom:6px}
+.sel{background:var(--bg2);border:1px solid var(--line);border-radius:999px;padding:5px 10px;font-size:12.5px;color:var(--text)}
 .owner-only{display:none!important}
 body.owner .owner-only{display:inline-flex!important}
 #scanWrap a{color:var(--text);text-decoration:underline;cursor:pointer}
@@ -172,7 +181,7 @@ footer{border-top:1px solid var(--line);padding:26px 0;color:var(--muted);font-s
   <div id="galleryHost"></div>
 </main>
 
-<footer><div class="wrap">© Gloan <span class="owner-only" id="scanWrap"> · <a id="scanBtn">Scan folder for new photos</a></span></div></footer>
+<footer><div class="wrap">© Gloan <span class="owner-only" id="scanWrap"> · <a id="scanBtn">Scan folder for new photos</a> · <a id="thumbBtn">Generate thumbnails</a></span></div></footer>
 
 <!-- upload modal -->
 <div class="modal" id="upModal"><div class="panel">
@@ -201,11 +210,22 @@ footer{border-top:1px solid var(--line);padding:26px 0;color:var(--muted);font-s
   <footer><button class="btn primary" id="loginGo">Log in</button></footer>
 </div></div>
 
+<!-- add tags (owner only; above the lightbox, which is z-index 80) -->
+<div class="modal" id="tagModal" style="z-index:90"><div class="panel" style="width:min(420px,100%)">
+  <header><h2 id="tagTitle">Add tags</h2><button class="btn icon" id="tagClose">✕</button></header>
+  <div class="body">
+    <input class="field" id="tagInput" placeholder="Tags to add (comma separated)" autocomplete="off">
+    <div class="sug" id="tagSug"></div>
+  </div>
+  <footer><button class="btn primary" id="tagGo">Add tags</button></footer>
+</div></div>
+
 <!-- lightbox -->
 <div class="lb" id="lb">
   <div class="lb-top">
     <span class="cnt" id="lbCnt"></span>
     <button class="btn" id="storyBtn" style="display:none" title="Story (S)">📖 <span class="lbl">Story</span></button>
+    <button class="btn owner-only" id="addTagBtn" title="Add tags">＋ tags</button>
     <button class="btn owner-only" id="editBtn" title="Edit (E)">✎ <span class="lbl">Edit</span></button>
     <button class="btn" id="playBtn" title="Slideshow (Space)">▶</button>
     <button class="btn" id="fsBtn" title="Fullscreen (F)">⛶</button>
@@ -238,7 +258,7 @@ const API={
     if(!r.ok)throw new Error(j.error||r.statusText);
     return j;
   },
-  list(){return this.call('GET','/api/photos')},
+  list(query){return this.call('GET','/api/photos?'+new URLSearchParams(query))},
   session(){return this.call('GET','/api/session')},
   login(password){return this.call('POST','/api/login',{body:JSON.stringify({password}),headers:{'Content-Type':'application/json'}})},
   upload(blob,title,tags){return this.call('POST','/api/photos',{body:blob,headers:{'Content-Type':blob.type||'application/octet-stream','X-Title':encodeURIComponent((title||'').slice(0,200)),'X-Tags':encodeURIComponent(tags.join(','))}})},
@@ -255,11 +275,23 @@ function setOwner(on){
 
 /* ---------- state ---------- */
 const $=s=>document.querySelector(s);
-let photos=[];          // {id,title,tags,blob,url,added}
 let active=new Set();   // active tag filters
 let matchAll=false;
 let layout=localStorage.getItem('gloan-layout')||'masonry';
-let view=[];            // currently filtered list
+// Everything below describes ONE page as sent by the server (filter, sort and paging happen server-side).
+let view=[];            // photos on the current page (lightbox/slideshow work on this)
+let filteredTotal=0;    // photos matching the tag filter, across all pages
+let photoTotal=0;       // photos in the whole gallery
+let pageCount=1;
+let tagList=[];         // [[tag,count]] over the whole gallery, for the filter chips
+let page=0;             // zero-based current page
+let pageSize=Number(localStorage.getItem('gloan-pagesize'))||10;
+let sortKey=localStorage.getItem('gloan-sort')||'new';
+let imageLoadRun=0;     // bumped on every render so a superseded sequential loader stops itself
+let refreshRun=0;       // bumped per fetch so a slow, outdated response cannot overwrite a newer one
+// Sort keys must match SORT_KEYS in gloan/query.py; labels are for the dropdown only.
+const SORTS={new:'Newest first',old:'Oldest first',az:'Title A–Z',za:'Title Z–A',big:'Largest file',small:'Smallest file'};
+const PAGE_SIZES=[10,20,50];
 let cur=0, playing=false, timer=null, storyOpen=true;
 const SLIDE_MS=4500;
 
@@ -270,8 +302,8 @@ const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,7);
 
 async function load(){
   try{
-    const [rows,sess]=await Promise.all([API.list(),API.session()]);
-    photos=rows; ready=true;
+    const sess=await API.session();
+    await fetchPage(); ready=true;
     $('#authBtn').style.display=(sess.owner||sess.canLogin)?'':'none'; // owner login is invisible from other addresses
     setOwner(sess.owner);
   }catch(e){
@@ -282,37 +314,80 @@ async function load(){
 }
 
 /* ---------- rendering ---------- */
-function tagCounts(){
-  const m=new Map(); photos.forEach(p=>p.tags.forEach(t=>m.set(t,(m.get(t)||0)+1)));
-  return [...m.entries()].sort((a,b)=>b[1]-a[1]||a[0].localeCompare(b[0]));
+function tagCounts(){return tagList}
+/* Ask the server for the current page (filter + sort + page number) and store the answer in the state vars. */
+async function fetchPage(){
+  const run=++refreshRun;
+  const query={page,size:pageSize,sort:sortKey,match:matchAll?'all':'any',tags:[...active].join(',')};
+  const reply=await API.list(query);
+  if(run!==refreshRun)return false; // a newer request superseded this one
+  const gone=[...active].filter(tag=>!reply.tags.some(([name])=>name===tag));
+  if(gone.length){gone.forEach(tag=>active.delete(tag));return fetchPage()} // a filter tag no longer exists
+  ({photos:view,total:filteredTotal,all:photoTotal,pages:pageCount,page,tags:tagList}=reply);
+  return true;
 }
-function applyFilter(){
-  const a=[...active];
-  view=!a.length?photos:photos.filter(p=>matchAll?a.every(t=>p.tags.includes(t)):a.some(t=>p.tags.includes(t)));
+/* Fetch the current page, then draw it. Use this after anything that changes data, filter, sort or page. */
+async function refresh(){
+  try{ if(await fetchPage())render() }catch(e){toast(e.message)}
+}
+/* Pager: First/Prev, numbered pages (with … gaps), Next/Last. Returns the element to append. */
+function buildPager(){
+  const box=mk('div','pager');
+  const first=page*pageSize+1, last=Math.min(filteredTotal,(page+1)*pageSize);
+  box.append(mk('div','info',`Showing ${first}–${last} of ${filteredTotal}`));
+  if(pageCount<2)return box;
+  const goTo=n=>{page=n;refresh();$('#filters').scrollIntoView({behavior:'smooth'})};
+  const add=(label,n,disabled,on)=>{const b=mk('button','btn'+(on?' on':''),label);b.disabled=!!disabled;b.onclick=()=>goTo(n);box.append(b)};
+  add('«',0,page===0); add('‹',page-1,page===0);
+  let previous=-1;
+  for(let n=0;n<pageCount;n++){
+    if(n!==0&&n!==pageCount-1&&Math.abs(n-page)>1)continue; // keep first, last and neighbours of current
+    if(previous>=0&&n-previous>1)box.append(mk('span','hint','…'));
+    add(String(n+1),n,false,n===page); previous=n;
+  }
+  add('›',page+1,page===pageCount-1); add('»',pageCount-1,page===pageCount-1);
+  return box;
+}
+/* Fetch the page's images one at a time in reading order (top-left first). Each image is assigned its
+   src only after the previous one finished (or failed), so nothing outside this page ever loads. */
+async function loadImagesInOrder(gallery){
+  const run=++imageLoadRun;
+  const cards=[...gallery.querySelectorAll('.card')];
+  // Sort by on-screen position (row, then column) because masonry's DOM order runs down columns, not across.
+  const position=card=>{const box=card.getBoundingClientRect();return [Math.round(box.top/20),box.left]};
+  cards.sort((a,b)=>{const [rowA,colA]=position(a),[rowB,colB]=position(b);return rowA-rowB||colA-colB});
+  for(const card of cards){
+    if(run!==imageLoadRun)return; // page changed meanwhile: stop
+    const image=card.querySelector('img');
+    await new Promise(done=>{image.onload=image.onerror=done;image.src=image.dataset.src});
+    card.classList.add('loaded');
+  }
 }
 function render(){
-  active=new Set([...active].filter(t=>photos.some(p=>p.tags.includes(t))));
-  applyFilter();
   const tags=tagCounts();
-  $('#sPhotos').textContent=photos.length; $('#sTags').textContent=tags.length;
+  $('#sPhotos').textContent=photoTotal; $('#sTags').textContent=tags.length;
 
   const f=$('#filters');
   f.innerHTML='';
-  const all=mk('button','chip'+(active.size?'':' on'),`All<small>${photos.length}</small>`);
-  all.onclick=()=>{active.clear();render()}; f.append(all);
+  const all=mk('button','chip'+(active.size?'':' on'),`All<small>${photoTotal}</small>`);
+  all.onclick=()=>{active.clear();page=0;refresh()}; f.append(all);
   tags.forEach(([t,n])=>{
     const c=mk('button','chip'+(active.has(t)?' on':''),`${t}<small>${n}</small>`);
-    c.onclick=()=>{active.has(t)?active.delete(t):active.add(t);render()}; f.append(c);
+    c.onclick=()=>{active.has(t)?active.delete(t):active.add(t);page=0;refresh()}; f.append(c);
   });
   const mode=mk('div','mode');
-  mode.innerHTML=`<div class="seg" title="Tag matching"><button data-m="any" class="${matchAll?'':'on'}">Any</button><button data-m="all" class="${matchAll?'on':''}">All</button></div>
+  mode.innerHTML=`<select class="sel" id="sortSel" title="Sort by">${Object.entries(SORTS).map(([key,label])=>`<option value="${key}"${key===sortKey?' selected':''}>${label}</option>`).join('')}</select>
+   <select class="sel" id="sizeSel" title="Photos per page">${PAGE_SIZES.map(n=>`<option value="${n}"${n===pageSize?' selected':''}>${n} / page</option>`).join('')}</select>
+   <div class="seg" title="Tag matching"><button data-m="any" class="${matchAll?'':'on'}">Any</button><button data-m="all" class="${matchAll?'on':''}">All</button></div>
    <div class="seg"><button data-l="masonry" class="${layout==='masonry'?'on':''}">Masonry</button><button data-l="uniform" class="${layout==='uniform'?'on':''}">Grid</button></div>`;
-  mode.querySelectorAll('[data-m]').forEach(b=>b.onclick=()=>{matchAll=b.dataset.m==='all';render()});
+  mode.querySelector('#sortSel').onchange=e=>{sortKey=e.target.value;localStorage.setItem('gloan-sort',sortKey);page=0;refresh()};
+  mode.querySelector('#sizeSel').onchange=e=>{pageSize=Number(e.target.value);localStorage.setItem('gloan-pagesize',pageSize);page=0;refresh()};
+  mode.querySelectorAll('[data-m]').forEach(b=>b.onclick=()=>{matchAll=b.dataset.m==='all';page=0;refresh()});
   mode.querySelectorAll('[data-l]').forEach(b=>b.onclick=()=>{layout=b.dataset.l;localStorage.setItem('gloan-layout',layout);render()});
   f.append(mode);
 
   const host=$('#galleryHost'); host.innerHTML='';
-  if(!photos.length){
+  if(!photoTotal){
     host.innerHTML=isOwner()
       ?`<div class="empty"><h2>Your gallery is empty</h2><p>Upload your first photos, or load a few generated samples to try the site out.</p>
       <div class="row"><button class="btn primary" id="e1">＋ Upload photos</button><button class="btn" id="e2">Load sample images</button></div></div>`
@@ -320,11 +395,12 @@ function render(){
     if(isOwner()){$('#e1').onclick=openUpload; $('#e2').onclick=loadDemo}
     return;
   }
-  if(!view.length){host.innerHTML='<div class="empty"><h2>No photos match</h2><p>Try fewer tags or switch to “Any”.</p></div>';return}
+  if(!filteredTotal){host.innerHTML='<div class="empty"><h2>No photos match</h2><p>Try fewer tags or switch to “Any”.</p></div>';return}
   const g=mk('div','gallery'+(layout==='uniform'?' uniform':''));
   view.forEach((p,i)=>{
     const c=mk('div','card');
-    c.innerHTML=`<img loading="lazy" src="${p.url}" alt="${esc(p.title||'')}"><div class="ov"><h3>${esc(p.title||'Untitled')}</h3>${p.story?'<div class="sb">📖 Read the story</div>':''}<div class="t">${p.tags.map(t=>`<span>${esc(t)}</span>`).join('')}</div></div>`;
+    c.innerHTML=`<img data-src="${p.thumbUrl||p.url}" alt="${esc(p.title||'')}"><div class="ov"><button class="btn owner-only addtag">＋ tags</button><h3>${esc(p.title||'Untitled')}</h3>${p.story?'<div class="sb">📖 Read the story</div>':''}<div class="t">${p.tags.map(t=>`<span>${esc(t)}</span>`).join('')}</div></div>`;
+    c.querySelector('.addtag').onclick=e=>{e.stopPropagation();openTagModal(p)}; // stop: don't also open the lightbox
     c.onclick=()=>openLB(i);
     c.addEventListener('mousemove',e=>{ // subtle tilt
       const r=c.getBoundingClientRect(),x=(e.clientX-r.left)/r.width-.5,y=(e.clientY-r.top)/r.height-.5;
@@ -333,6 +409,8 @@ function render(){
     g.append(c);
   });
   host.append(g);
+  host.append(buildPager());
+  loadImagesInOrder(g); // deliberately not awaited: images stream in while the page stays interactive
   const io=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){const el=e.target;setTimeout(()=>el.classList.add('in'),(el._d||0));io.unobserve(el)}}),{threshold:.05});
   g.querySelectorAll('.card').forEach((c,i)=>{c._d=(i%8)*60;io.observe(c)});
 }
@@ -361,11 +439,15 @@ function renderStaged(){
   });
   $('#saveUp').disabled=!staged.length;
   $('#stCount').textContent=staged.length?`${staged.length} selected`:'';
-  const sug=$('#sugAll'); sug.innerHTML='';
+  suggestionChips($('#sugAll'),$('#allTags'));
+}
+/* Popular-tag chips that append to a comma-separated input; shared by the upload and add-tags dialogs. */
+function suggestionChips(container,input){
+  container.innerHTML='';
   tagCounts().slice(0,12).forEach(([t])=>{
     const c=mk('button','chip',t);
-    c.onclick=()=>{const cur=parseTags($('#allTags').value);if(!cur.includes(t))cur.push(t);$('#allTags').value=cur.join(', ')};
-    sug.append(c);
+    c.onclick=()=>{const chosen=parseTags(input.value);if(!chosen.includes(t))chosen.push(t);input.value=chosen.join(', ')};
+    container.append(c);
   });
 }
 async function resize(file,max=2400){
@@ -384,13 +466,13 @@ async function saveStaged(){
     try{
       const blob=await resize(s.file);
       const tags=[...new Set([...shared,...parseTags(s.tags)])];
-      photos.unshift(await API.upload(blob,s.title.trim(),tags));
+      await API.upload(blob,s.title.trim(),tags);
     }catch(e){console.error(e);toast(`${s.file.name}: ${e.message}`)}
     prog.firstElementChild.style.width=(++n/staged.length*100)+'%';
   }
-  photos.sort((a,b)=>b.added-a.added);
+  page=0; await refresh(); // newest first lands on page 1
   prog.style.display='none'; prog.firstElementChild.style.width='0';
-  const count=staged.length; closeUpload(); render(); toast(`Added ${count} photo${count>1?'s':''}`);
+  const count=staged.length; closeUpload(); toast(`Added ${count} photo${count>1?'s':''}`); runThumbnailJob();
 }
 
 /* ---------- lightbox ---------- */
@@ -404,19 +486,19 @@ function show(instant){
     $('#lbTitle').textContent=p.title||'Untitled';
     $('#lbCnt').textContent=`${cur+1} / ${view.length}`;
     $('#lbTags').innerHTML=p.tags.map(t=>`<span data-t="${esc(t)}">${esc(t)}</span>`).join('');
-    $('#lbTags').querySelectorAll('span').forEach(s=>s.onclick=()=>{closeLB();active=new Set([s.dataset.t]);render();scrollTo({top:300,behavior:'smooth'})});
+    $('#lbTags').querySelectorAll('span').forEach(s=>s.onclick=()=>{closeLB();active=new Set([s.dataset.t]);page=0;refresh();scrollTo({top:300,behavior:'smooth'})});
     $('#eTitle').value=p.title||''; $('#eTags').value=p.tags.join(', '); $('#eStory').value=p.story||'';
     $('#stTitle').textContent=p.title||'Untitled'; $('#stBody').textContent=p.story||'';
     $('#storyBtn').style.display=p.story?'':'none'; lb.classList.toggle('story-open',!!p.story&&storyOpen);
     $('#strip').querySelectorAll('img').forEach((t,j)=>{t.classList.toggle('on',j===cur); if(j===cur)t.scrollIntoView({inline:'center',block:'nearest',behavior:instant?'auto':'smooth'})});
-    // preload neighbours
+    // preload neighbours so next/previous feels instant (full-size images load only inside the lightbox)
     [1,-1].forEach(d=>{const n=view[(cur+d+view.length)%view.length];if(n)new Image().src=n.url});
   };
   if(instant) swap(); else { img.classList.add('out'); setTimeout(swap,260); }
   if(playing) restartBar();
 }
 function go(d){ if(!view.length)return; cur=(cur+d+view.length)%view.length; $('#sbox').classList.remove('zoom'); show(); }
-function buildStrip(){ const s=$('#strip'); s.innerHTML=''; view.forEach((p,i)=>{const t=mk('img');t.src=p.url;t.onclick=()=>{cur=i;show()};s.append(t)}); }
+function buildStrip(){ const s=$('#strip'); s.innerHTML=''; view.forEach((p,i)=>{const t=mk('img');t.src=p.thumbUrl||p.url;t.onclick=()=>{cur=i;show()};s.append(t)}); }
 function restartBar(){ const b=$('#pbar'); b.style.transition='none'; b.style.width='0'; void b.offsetWidth; b.style.transition=`width ${SLIDE_MS}ms linear`; b.style.width='100%'; clearTimeout(timer); timer=setTimeout(()=>go(1),SLIDE_MS); }
 function play(){ playing=true; $('#playBtn').textContent='❚❚'; lb.classList.add('chromeless'); restartBar(); }
 function stop(){ playing=false; clearTimeout(timer); $('#playBtn').textContent='▶'; lb.classList.remove('chromeless'); const b=$('#pbar'); b.style.transition='none'; b.style.width='0'; }
@@ -425,14 +507,55 @@ async function saveEdit(){
   const p=view[cur];
   try{Object.assign(p,await API.update(p.id,$('#eTitle').value.trim(),parseTags($('#eTags').value),$('#eStory').value))}
   catch(e){toast(e.message);return}
-  const id=p.id; render(); const i=view.findIndex(x=>x.id===id); if(i<0){closeLB();toast('Saved — hidden by current filter');return}
-  cur=i; buildStrip(); show(true); toast('Saved');
+  await afterPhotoEdit(p.id,'Saved');
+}
+/* After a photo's metadata changed: reload the page and, if the lightbox is open, stay on that photo. */
+async function afterPhotoEdit(id,message){
+  await refresh();
+  if(!lb.classList.contains('open')){toast(message);return}
+  const i=view.findIndex(x=>x.id===id);
+  if(i<0){closeLB();toast(message+' — hidden by current filter');return}
+  cur=i; buildStrip(); show(true); toast(message);
+}
+/* ---------- add tags (owner only; the server enforces this too) ---------- */
+let taggingPhoto=null;
+function openTagModal(photo){
+  if(!isOwner())return;
+  taggingPhoto=photo;
+  $('#tagTitle').textContent='Add tags — '+(photo.title||'Untitled');
+  $('#tagInput').value=''; suggestionChips($('#tagSug'),$('#tagInput'));
+  $('#tagModal').classList.add('open'); setTimeout(()=>$('#tagInput').focus(),30);
+}
+function closeTagModal(){ $('#tagModal').classList.remove('open'); taggingPhoto=null; }
+async function submitTags(){
+  const photo=taggingPhoto, added=parseTags($('#tagInput').value);
+  if(!photo||!added.length){closeTagModal();return}
+  closeTagModal();
+  try{await API.update(photo.id,photo.title||'',[...new Set([...photo.tags,...added])],photo.story||'')}
+  catch(e){toast(e.message);return}
+  await afterPhotoEdit(photo.id,`Added ${added.length} tag${added.length>1?'s':''}`);
+}
+/* ---------- tile images: ask the server to run tools/make_thumbnails.py, then wait for it ---------- */
+async function runThumbnailJob(){
+  try{
+    try{await API.call('POST','/api/thumbnails')}
+    catch(e){if(!/already running/.test(e.message))throw e} // joining a run that is already going is fine
+    toast('Generating thumbnails…');
+    for(;;){
+      await new Promise(done=>setTimeout(done,1500));
+      const status=await API.call('GET','/api/thumbnails');
+      if(status.running)continue;
+      await refresh();
+      toast(status.exitCode===0?(status.missing?`${status.missing} photo(s) still have no thumbnail`:'Thumbnails up to date')
+        :'Thumbnail tool failed: '+(status.output.trim().split('\n').pop()||'unknown error'));
+      return;
+    }
+  }catch(e){toast(e.message)}
 }
 async function delPhoto(){
   const p=view[cur]; if(!confirm(`Delete “${p.title||'Untitled'}”?`))return;
   try{await API.remove(p.id)}catch(e){toast(e.message);return}
-  photos=photos.filter(x=>x.id!==p.id);
-  render(); if(!view.length){closeLB();return} cur=Math.min(cur,view.length-1); buildStrip(); show(true);
+  await refresh(); if(!view.length){closeLB();return} cur=Math.min(cur,view.length-1); buildStrip(); show(true);
 }
 
 /* ---------- events ---------- */
@@ -451,6 +574,9 @@ $('#fsBtn').onclick=()=>document.fullscreenElement?document.exitFullscreen():lb.
 const toggleStory=()=>{storyOpen=!storyOpen;lb.classList.toggle('story-open',storyOpen&&!!view[cur]?.story)};
 $('#storyBtn').onclick=toggleStory; $('#storyX').onclick=toggleStory;
 $('#editBtn').onclick=()=>lb.classList.toggle('show-edit');
+$('#addTagBtn').onclick=()=>openTagModal(view[cur]);
+$('#tagGo').onclick=submitTags; $('#tagClose').onclick=closeTagModal;
+$('#tagModal').addEventListener('mousedown',e=>{if(e.target.id==='tagModal')closeTagModal()});
 $('#eSave').onclick=saveEdit; $('#delBtn').onclick=delPhoto;
 img.onclick=()=>$('#sbox').classList.toggle('zoom');
 lb.addEventListener('mousemove',()=>{ if(playing){lb.classList.remove('chromeless');clearTimeout(lb._h);lb._h=setTimeout(()=>playing&&lb.classList.add('chromeless'),2200)} });
@@ -458,6 +584,7 @@ lb.addEventListener('mousemove',()=>{ if(playing){lb.classList.remove('chromeles
 let tx=0; $('#sbox').addEventListener('touchstart',e=>tx=e.touches[0].clientX,{passive:true});
 $('#sbox').addEventListener('touchend',e=>{const d=e.changedTouches[0].clientX-tx;if(Math.abs(d)>50)go(d<0?1:-1)});
 document.addEventListener('keydown',e=>{
+  if(e.target.id==='tagInput'){ if(e.key==='Enter')submitTags(); else if(e.key==='Escape')closeTagModal(); return }
   if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'){ if(e.key==='Enter'&&e.target.tagName==='INPUT'&&e.target.closest('.editrow'))saveEdit(); if(e.key==='Escape'&&$('#upModal').classList.contains('open'))closeUpload(); return }
   if($('#upModal').classList.contains('open')){ if(e.key==='Escape')closeUpload(); return }
   if(!lb.classList.contains('open'))return;
@@ -485,8 +612,9 @@ $('#loginGo').onclick=doLogin; $('#loginClose').onclick=closeLogin;
 $('#pw').onkeydown=e=>{ if(e.key==='Enter')doLogin(); else if(e.key==='Escape')closeLogin(); };
 $('#loginModal').addEventListener('mousedown',e=>{ if(e.target.id==='loginModal')closeLogin() });
 
+$('#thumbBtn').onclick=runThumbnailJob;
 $('#scanBtn').onclick=async()=>{
-  try{ const r=await API.call('POST','/api/rescan'); photos=await API.list(); render(); toast(r.added?`Added ${r.added} photo${r.added>1?'s':''} from the folder`:`No new photos found (${r.indexed} already listed${r.skipped.length?'; skipped: '+r.skipped.join(', '):''})`) }
+  try{ const r=await API.call('POST','/api/rescan'); page=0; await refresh(); toast(r.added?`Added ${r.added} photo${r.added>1?'s':''} from the folder`:`No new photos found (${r.indexed} already listed${r.skipped.length?'; skipped: '+r.skipped.join(', '):''})`) }
   catch(e){ toast(e.message) }
 };
 
@@ -538,9 +666,9 @@ async function loadDemo(){
   toast('Generating samples…');
   for(const [title,tags,c] of L){
     const blob=await new Promise(r=>c.toBlob(r,'image/jpeg',.88));
-    try{photos.push(await API.upload(blob,title,tags))}catch(e){toast(e.message);break}
+    try{await API.upload(blob,title,tags)}catch(e){toast(e.message);break}
   }
-  photos.sort((a,b)=>b.added-a.added); render(); toast('Sample images added — delete them any time');
+  page=0; await refresh(); toast('Sample images added — delete them any time');
 }
 
 document.documentElement.dataset.theme=localStorage.getItem('gloan-theme')||'dark';

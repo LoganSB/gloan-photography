@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Docker: Debug Website (attach)",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": { "host": "localhost", "port": 5678 },
+      "pathMappings": [
+        { "localRoot": "${workspaceFolder}", "remoteRoot": "/app" }
+      ],
+      "justMyCode": true,
+      "preLaunchTask": "docker: up (debug)",
+      "postDebugTask": "docker: down (debug)"
+    }
+  ]
+}
