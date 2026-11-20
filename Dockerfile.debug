@@ -6,8 +6,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install debugpy for VS Code remote debugging
-RUN pip install --no-cache-dir debugpy pillow
+# Install debugpy for VS Code remote debugging, Flask + Gunicorn for the server, and Pillow for make_thumbnails.py
+COPY requirements.txt ./requirements.txt
+COPY tools/requirements.txt ./tools/requirements.txt
+RUN pip install --no-cache-dir debugpy -r requirements.txt -r tools/requirements.txt
 
 # Create data directory and permissions
 RUN mkdir -p /data

@@ -5,7 +5,7 @@ import sys
 import threading
 
 from gloan.config import ROOT
-from gloan.storage import available_rows, thumb_path
+from gloan.storage import available_rows, bump_index_generation, thumb_path
 
 TOOL_PATH = ROOT / 'tools' / 'make_thumbnails.py'
 JOB_TIMEOUT_SECONDS = 1800  # a huge first run may take a while, but must not hang forever
@@ -25,6 +25,7 @@ def _run_job() -> None:
         outcome = {'exitCode': -1, 'output': f'could not run the thumbnail tool: {error}'}
     with _state_lock:
         _state.update(running=False, **outcome)
+    bump_index_generation()
 
 
 def start_thumbnail_job() -> bool:

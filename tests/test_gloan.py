@@ -1,19 +1,21 @@
-"""Unit and integration tests for Gloan (backend API, thumbnail tool, and frontend JavaScript syntax)."""
+"""Unit and integration tests for Gloan (Flask API, storage/tag caches, thumbnail tool and ES module syntax)."""
 
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+from werkzeug.serving import BaseWSGIServer, make_server
 
 # Point GLOAN_DATA at an isolated temporary directory BEFORE importing gloan modules.
 TEST_DATA_DIR = Path(tempfile.mkdtemp(prefix='gloan_test_'))
@@ -21,10 +23,11 @@ os.environ['GLOAN_DATA'] = str(TEST_DATA_DIR)
 
 from gloan.auth import Auth, FAILS, normalize_ip  # noqa: E402
 from gloan.config import PHOTO_DIR, ROOT, THUMB_DIR  # noqa: E402
-from gloan.handler import Handler  # noqa: E402
-from gloan.storage import available_rows, load_index, save_index, scan_folder, sniff_ext  # noqa: E402
+from gloan.handler import Handler, app  # noqa: E402
+from gloan.storage import available_rows, get_rows_cache, load_index, save_index, sniff_ext  # noqa: E402
+from gloan.tags import TagIndex, get_tag_index, search_key  # noqa: E402
 
-# Minimal valid 1x1 JPEG and 1x1 PNG bytes for upload / thumbnail tests.
+# Minimal valid 1x1 JPEG bytes for upload / thumbnail tests.
 TINY_JPEG = (
     b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00\xff\xdb\x00C\x00'
     b'\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f'
@@ -47,10 +50,10 @@ def tearDownModule() -> None:
 
 
 class FrontendSyntaxTest(unittest.TestCase):
-    """Ensure the embedded <script> in index.html has valid JavaScript syntax and no broken literals."""
+    """Ensure index.html has no inline script (CSP-clean) and all static/*.js ES modules have valid syntax."""
 
     @staticmethod
-    def assert_valid_javascript_literals(script_source: str) -> None:
+    def assert_valid_javascript_literals(script_source: str, filename: str = '<script>') -> None:
         """Scan JS source to verify single/double quotes never cross line boundaries and brackets balance.
 
         Runs everywhere without external tools so syntax regressions (like an unescaped newline inside a single-
@@ -61,7 +64,7 @@ class FrontendSyntaxTest(unittest.TestCase):
         line_number = 1
         length = len(script_source)
         prev_significant = ''
-        regex_Follows = {'(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', '\n', ''}
+        regex_follows = {'(', ',', '=', ':', '[', '!', '&', '|', '?', '{', '}', ';', '\n', ''}
 
         while index < length:
             char = script_source[index]
@@ -77,7 +80,7 @@ class FrontendSyntaxTest(unittest.TestCase):
             if char == '/' and nxt == '*':
                 end = script_source.find('*/', index + 2)
                 if end == -1:
-                    raise AssertionError(f'Unclosed /* comment starting on line {line_number}')
+                    raise AssertionError(f'{filename}: Unclosed /* comment starting on line {line_number}')
                 line_number += script_source[index:end + 2].count('\n')
                 index = end + 2
                 continue
@@ -91,10 +94,10 @@ class FrontendSyntaxTest(unittest.TestCase):
                         index += 2
                         continue
                     if script_source[index] in ('\n', '\r'):
-                        raise AssertionError(f'Unterminated {quote} string literal on line {start_line}')
+                        raise AssertionError(f'{filename}: Unterminated {quote} string literal on line {start_line}')
                     index += 1
                 if index >= length:
-                    raise AssertionError(f'Unclosed {quote} string literal starting on line {start_line}')
+                    raise AssertionError(f'{filename}: Unclosed {quote} string literal starting on line {start_line}')
                 prev_significant = quote
                 index += 1
                 continue
@@ -110,12 +113,12 @@ class FrontendSyntaxTest(unittest.TestCase):
                         line_number += 1
                     index += 1
                 if index >= length:
-                    raise AssertionError(f'Unclosed template literal ` starting on line {start_line}')
+                    raise AssertionError(f'{filename}: Unclosed template literal ` starting on line {start_line}')
                 prev_significant = '`'
                 index += 1
                 continue
             # Regex literal (/.../) when preceded by an operator/delimiter token
-            if char == '/' and prev_significant in regex_Follows:
+            if char == '/' and prev_significant in regex_follows:
                 start_line = line_number
                 index += 1
                 in_char_class = False
@@ -131,7 +134,7 @@ class FrontendSyntaxTest(unittest.TestCase):
                     elif c == '/' and not in_char_class:
                         break
                     elif c in ('\n', '\r'):
-                        raise AssertionError(f'Unterminated regex literal on line {start_line}')
+                        raise AssertionError(f'{filename}: Unterminated regex literal on line {start_line}')
                     index += 1
                 prev_significant = '/'
                 index += 1
@@ -142,7 +145,7 @@ class FrontendSyntaxTest(unittest.TestCase):
             elif char in ')]}':
                 expected = {')': '(', ']': '[', '}': '{'}[char]
                 if not stack or stack[-1][0] != expected:
-                    raise AssertionError(f'Unmatched {char!r} on line {line_number}')
+                    raise AssertionError(f'{filename}: Unmatched {char!r} on line {line_number}')
                 stack.pop()
             if not char.isspace():
                 prev_significant = char
@@ -150,48 +153,203 @@ class FrontendSyntaxTest(unittest.TestCase):
 
         if stack:
             opener, start_line = stack[-1]
-            raise AssertionError(f'Unclosed {opener!r} from line {start_line}')
+            raise AssertionError(f'{filename}: Unclosed {opener!r} from line {start_line}')
 
-    def test_index_html_javascript_syntax(self) -> None:
-        """Extract <script> from index.html and validate JS syntax (built-in scanner + node --check if available)."""
+    def test_index_html_and_static_modules_syntax(self) -> None:
+        """Verify index.html has no inline JS, static/*.js modules pass syntax checks, and upload skips thumbnails."""
         html_text = (ROOT / 'index.html').read_text(encoding='utf-8')
-        match = re.search(r'<script>(.*)</script>', html_text, re.DOTALL)
-        self.assertIsNotNone(match, 'index.html must contain a <script> block')
-        script_source = match.group(1)
+        self.assertIn('<link rel="stylesheet" href="/static/app.css">', html_text)
+        self.assertIn('<script type="module" src="/static/app.js"></script>', html_text)
+        inline_scripts = [body.strip() for body in re.findall(r'<script[^>]*>(.*?)</script>', html_text, re.DOTALL)]
+        self.assertEqual(inline_scripts, [''], 'index.html must not contain inline JS (blocked by CSP script-src self)')
 
-        # Always run the pure-Python lexer check (works inside sandbox and inside the slim Docker image).
-        self.assert_valid_javascript_literals(script_source)
+        static_dir = ROOT / 'static'
+        self.assertTrue((static_dir / 'app.css').is_file(), 'static/app.css must exist')
+        expected_modules = ('api.js', 'gallery.js', 'lightbox.js', 'upload.js', 'search.js', 'app.js')
+        js_files = sorted(static_dir.glob('*.js'))
+        self.assertEqual({path.name for path in js_files}, set(expected_modules))
 
-        # Also run `node --check` if a Node binary is accessible.
-        node_candidates = [shutil.which('node'), '/mnt/c/Program Files/nodejs/node.exe']
+        # Upload module must not auto-trigger runThumbnailJob (which would consume Cloud Run CPU on upload).
+        upload_source = (static_dir / 'upload.js').read_text(encoding='utf-8')
+        self.assertNotIn('runThumbnailJob(', upload_source)
+
+        # Verify instant-response UI loading indicators exist in HTML, CSS and JS modules.
+        self.assertIn('id="lbLoader"', html_text)
+        self.assertIn('Loading image…', html_text)
+        css_source = (static_dir / 'app.css').read_text(encoding='utf-8')
+        self.assertIn('.spinner', css_source)
+        self.assertIn('.card-loader', css_source)
+        self.assertIn('.lb-loader', css_source)
+        gallery_source = (static_dir / 'gallery.js').read_text(encoding='utf-8')
+        self.assertIn('card-loader', gallery_source)
+        self.assertIn('Loading image…', gallery_source)
+        lightbox_source = (static_dir / 'lightbox.js').read_text(encoding='utf-8')
+        self.assertIn("classList.add('loading')", lightbox_source)
+        self.assertIn('withBusy(', lightbox_source)
+
+        node_candidates = [shutil.which('node'), '/mnt/c/Program Files/nodejs/node.exe', 'C:/Program Files/nodejs/node.exe']
         node_binary = next((candidate for candidate in node_candidates if candidate and Path(candidate).exists()), None)
-        if node_binary:
-            with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False, encoding='utf-8') as temp_js:
-                temp_js.write(script_source)
-                temp_path = temp_js.name
-            try:
-                check_arg = temp_path
-                if node_binary.endswith('.exe') and shutil.which('wslpath'):
-                    check_arg = subprocess.check_output(['wslpath', '-w', temp_path], text=True).strip()
-                result = subprocess.run([node_binary, '--check', check_arg], capture_output=True, text=True, check=False)
-                self.assertEqual(result.returncode, 0, f'JavaScript syntax error in index.html:\n{result.stderr}')
-            finally:
-                Path(temp_path).unlink(missing_ok=True)
+
+        for js_path in js_files:
+            source = js_path.read_text(encoding='utf-8')
+            self.assert_valid_javascript_literals(source, js_path.name)
+            if node_binary:
+                # Use .mjs extension for the syntax check so Node parses ES module import/export syntax.
+                with tempfile.NamedTemporaryFile('w', suffix='.mjs', delete=False, encoding='utf-8') as temp_mjs:
+                    temp_mjs.write(source)
+                    temp_path = temp_mjs.name
+                try:
+                    check_arg = temp_path
+                    if node_binary.endswith('.exe') and shutil.which('wslpath') and temp_path.startswith('/'):
+                        check_arg = subprocess.check_output(['wslpath', '-w', temp_path], text=True).strip()
+                    result = subprocess.run([node_binary, '--check', check_arg],
+                                            capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, 0, f'JS syntax error in {js_path.name}:\n{result.stderr}')
+                finally:
+                    Path(temp_path).unlink(missing_ok=True)
+
+
+class RowsCacheTest(unittest.TestCase):
+    """The in-memory RowsCache is reused until photos.json, photos/ or thumbs/ change."""
+
+    def setUp(self) -> None:
+        """Create a fresh data directory with one photo file and its index row."""
+        shutil.rmtree(TEST_DATA_DIR, ignore_errors=True)
+        PHOTO_DIR.mkdir(parents=True, exist_ok=True)
+        THUMB_DIR.mkdir(parents=True, exist_ok=True)
+        (PHOTO_DIR / 'p1111111111111111.jpg').write_bytes(TINY_JPEG)
+        save_index([{'id': 'p1111111111111111', 'ext': 'jpg', 'title': 'First', 'tags': ['a'], 'added': 1}])
+
+    def test_rows_cache_reused_and_invalidated(self) -> None:
+        """Same RowsCache snapshot while nothing changes; rebuilt after save_index or external file modification."""
+        first = get_rows_cache()
+        self.assertIs(get_rows_cache(), first)
+        self.assertEqual(len(available_rows()), 1)
+        self.assertEqual(first.photo_sizes['p1111111111111111.jpg'], len(TINY_JPEG))
+
+        # In-process save bumps generation and rebuilds the cache.
+        save_index([{'id': 'p1111111111111111', 'ext': 'jpg', 'title': 'Renamed', 'tags': ['a'], 'added': 1}])
+        second = get_rows_cache()
+        self.assertIsNot(second, first)
+        self.assertEqual(available_rows()[0]['title'], 'Renamed')
+
+        # External modification to photos.json is detected via mtime/size.
+        index_file = TEST_DATA_DIR / 'photos.json'
+        index_file.write_text(json.dumps([{'id': 'p1111111111111111', 'ext': 'jpg', 'title': 'External Edit',
+                                           'tags': ['a'], 'added': 1}]), encoding='utf-8')
+        future_ns = time.time_ns() + 5_000_000_000
+        os.utime(index_file, ns=(future_ns, future_ns))
+        self.assertEqual(available_rows()[0]['title'], 'External Edit')
+
+
+class TagSearchTest(unittest.TestCase):
+    """Typo-tolerant tag matching and ranking (pure functions, no server needed)."""
+
+    def setUp(self) -> None:
+        """A small tag set: counts decide popularity order among equally good matches."""
+        rows = [
+            {'tags': ['mountain', 'sunshine', 'Japan', 'single_subject', 'café']},
+            {'tags': ['mountain', 'mount-fuji', 'sunset', 'abc']},
+            {'tags': ['mountain', 'sunset']},
+        ]
+        self.index = TagIndex(rows)
+
+    def top(self, query: str) -> tuple[str, str] | None:
+        """(tag, match kind) of the best suggestion for `query`, or None."""
+        results = self.index.search(query, 8)
+        return (results[0]['tag'], results[0]['match']) if results else None
+
+    def test_counts_and_popular_order(self) -> None:
+        """Counts come from the rows; an empty query returns most-used tags first."""
+        self.assertEqual(self.index.counts['mountain'], 3)
+        self.assertEqual([item['tag'] for item in self.index.search('', 2)], ['mountain', 'sunset'])
+
+    def test_normalisation(self) -> None:
+        """Case, accents and space/underscore/hyphen differences do not matter."""
+        self.assertEqual(search_key('  Single  Subject '), 'single-subject')
+        self.assertEqual(self.top('JAPAN'), ('Japan', 'exact'))
+        self.assertEqual(self.top('single subject'), ('single_subject', 'exact'))
+        self.assertEqual(self.top('cafe'), ('café', 'exact'))
+
+    def test_prefix_word_and_contains(self) -> None:
+        """Autocomplete prefix, start of a later word, and plain substring all match, in that order."""
+        self.assertEqual(self.top('mou'), ('mountain', 'prefix'))
+        self.assertEqual(self.top('subj'), ('single_subject', 'word'))
+        self.assertEqual(self.top('unshi'), ('sunshine', 'contains'))
+        kinds = [item['match'] for item in self.index.search('mount', 8)]
+        self.assertEqual(kinds, sorted(kinds, key=['exact', 'prefix', 'word', 'contains', 'fuzzy'].index))
+
+    def test_single_character_mistakes(self) -> None:
+        """Wrong letter, missing letter, extra letter and swapped neighbours are each forgiven once."""
+        for typo in ('mointain', 'mountin', 'mounttain', 'moutnain'):
+            with self.subTest(typo=typo):
+                self.assertEqual(self.top(typo), ('mountain', 'fuzzy'))
+        self.assertIsNone(self.top('mxuntxin'), 'two mistakes must not match')
+
+    def test_short_queries_are_not_fuzzy(self) -> None:
+        """Two-letter queries only match exactly/prefix/substring; 'zz' finds nothing."""
+        self.assertIsNone(self.top('zz'))
+
+    def test_wildcards(self) -> None:
+        """'*' and '?' work shell-style against the whole tag."""
+        self.assertEqual(self.top('*shine'), ('sunshine', 'wildcard'))
+        self.assertEqual(self.top('suns?t'), ('sunset', 'wildcard'))
+
+    def test_regex_input_is_literal_and_bounded(self) -> None:
+        """Regex syntax in the query is matched literally (no injection) and very long text is harmless."""
+        # As regex, 'a..' would match 'abc'; literally it is two typos away, so it must find nothing.
+        self.assertIsNone(self.top('a..'))
+        self.assertEqual(self.index.search('(((((', 8), [])
+        self.assertEqual(self.index.search('m' * 5000, 8), [])
+
+    def test_result_cache_returns_same_object(self) -> None:
+        """Repeated queries (even differently spaced/cased) are answered from the per-index result cache."""
+        self.assertIs(self.index.search('mount', 8), self.index.search(' MOUNT ', 8))
+
+
+class TagCacheTest(unittest.TestCase):
+    """The shared TagIndex is reused until photos.json or photos/ change."""
+
+    def setUp(self) -> None:
+        """Fresh data folder with one photo file and its index row."""
+        shutil.rmtree(TEST_DATA_DIR, ignore_errors=True)
+        PHOTO_DIR.mkdir(parents=True, exist_ok=True)
+        (PHOTO_DIR / 'p1111111111111111.jpg').write_bytes(TINY_JPEG)
+        save_index([{'id': 'p1111111111111111', 'ext': 'jpg', 'title': 'One', 'tags': ['alpha'], 'added': 1}])
+
+    def test_cache_reused_then_rebuilt(self) -> None:
+        """Same object while nothing changes; a new one after an in-process save or an outside edit."""
+        first = get_tag_index()
+        self.assertIs(get_tag_index(), first)
+        self.assertEqual(first.counts, {'alpha': 1})
+
+        save_index([{'id': 'p1111111111111111', 'ext': 'jpg', 'title': 'One', 'tags': ['beta'], 'added': 1}])
+        second = get_tag_index()
+        self.assertIsNot(second, first)
+        self.assertEqual(second.counts, {'beta': 1})
+
+        # Another process (e.g. tools/make_thumbnails.py) rewriting the file is caught via mtime/size.
+        index_file = TEST_DATA_DIR / 'photos.json'
+        index_file.write_text(json.dumps([{'id': 'p1111111111111111', 'ext': 'jpg', 'title': 'One',
+                                           'tags': ['gamma', 'delta'], 'added': 1}]), encoding='utf-8')
+        future_ns = time.time_ns() + 5_000_000_000
+        os.utime(index_file, ns=(future_ns, future_ns))
+        self.assertEqual(get_tag_index().counts, {'gamma': 1, 'delta': 1})
 
 
 class ServerAndApiTest(unittest.TestCase):
-    """End-to-end tests of the HTTP server, storage, paging, sorting, missing-file skipping, and auth."""
+    """End-to-end tests of the Flask server, static assets, CSP, storage, paging, sorting and auth."""
 
-    server: ThreadingHTTPServer
+    server: BaseWSGIServer
     base_url: str
 
     @classmethod
     def setUpClass(cls) -> None:
-        """Start the HTTP server on an ephemeral localhost port."""
+        """Start the Flask WSGI server on an ephemeral localhost port."""
         Handler.auth = Auth('debugpassword')
         Handler.owner_ips = frozenset()
-        cls.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-        port = cls.server.server_address[1]
+        cls.server = make_server('127.0.0.1', 0, app, threaded=True)
+        port = cls.server.server_port
         cls.base_url = f'http://127.0.0.1:{port}'
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
 
@@ -224,6 +382,19 @@ class ServerAndApiTest(unittest.TestCase):
             finally:
                 error.close()
 
+    def test_static_files_and_csp_headers(self) -> None:
+        """Index page and static ES modules are served with Content-Security-Policy: script-src 'self'."""
+        with app.test_client() as client:
+            with client.get('/') as index_res:
+                self.assertEqual(index_res.status_code, 200)
+                self.assertIn("script-src 'self'", index_res.headers.get('Content-Security-Policy', ''))
+                self.assertEqual(index_res.headers.get('X-Content-Type-Options'), 'nosniff')
+
+            for asset in ('/static/app.css', '/static/app.js', '/static/api.js', '/static/gallery.js',
+                          '/static/lightbox.js', '/static/upload.js', '/static/search.js'):
+                with client.get(asset) as asset_res:
+                    self.assertEqual(asset_res.status_code, 200, f'Failed to fetch {asset}')
+
     def test_thumbnail_tool_if_pillow_installed(self) -> None:
         """When Pillow is installed (as inside the Docker containers), test tools/make_thumbnails.py end-to-end."""
         try:
@@ -236,7 +407,7 @@ class ServerAndApiTest(unittest.TestCase):
             {'Authorization': f'Bearer {token}', 'Content-Type': 'image/jpeg', 'X-Title': 'ThumbTest', 'X-Tags': 't'})
         self.assertEqual(status, 201)
         result = subprocess.run(
-            ['python3', str(ROOT / 'tools' / 'make_thumbnails.py')],
+            [sys.executable, str(ROOT / 'tools' / 'make_thumbnails.py')],
             env={**os.environ, 'GLOAN_DATA': str(TEST_DATA_DIR)},
             capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -308,6 +479,28 @@ class ServerAndApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         _, after_delete = self.api_call('/api/photos')
         self.assertEqual(after_delete['total'], 2)
+
+    def test_tag_search_endpoint(self) -> None:
+        """GET /api/tags suggests tags (typo-tolerant), clamps the limit, and reflects edits immediately."""
+        token = self.login_token()
+        status, row = self.api_call(
+            '/api/photos', 'POST', TINY_JPEG,
+            {'Authorization': f'Bearer {token}', 'Content-Type': 'image/jpeg', 'X-Title': 'T',
+             'X-Tags': 'landscape,lake'})
+        self.assertEqual(status, 201)
+        status, reply = self.api_call('/api/tags?q=landscpe')
+        self.assertEqual(status, 200)
+        self.assertEqual(reply['suggestions'][0], {'tag': 'landscape', 'count': 1, 'match': 'fuzzy'})
+        _, reply = self.api_call('/api/tags?q=&limit=999')
+        self.assertEqual(len(reply['suggestions']), 2)
+
+        # Editing tags must invalidate the cached index right away.
+        self.api_call(f'/api/photos/{row["id"]}', 'PATCH', json.dumps({'title': 'T', 'tags': ['river']}).encode(),
+                      {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'})
+        _, reply = self.api_call('/api/tags?q=rivr')
+        self.assertEqual(reply['suggestions'][0]['tag'], 'river')
+        _, listing = self.api_call('/api/photos')
+        self.assertEqual(listing['tags'], [['river', 1]])
 
     def test_auth_and_rescan_guard(self) -> None:
         """Unauthenticated calls to owner routes (upload, rescan, thumbnails) return 401 cleanly."""

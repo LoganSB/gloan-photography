@@ -4,6 +4,7 @@ from typing import Any
 
 from gloan.config import DEFAULT_PAGE_SIZE, MAX_FILTER_TAGS, MAX_PAGE_SIZE
 from gloan.storage import available_rows, file_size, public_row
+from gloan.tags import get_tag_index
 
 
 # sort name -> (key function, newest/largest/Z-first?). Names must match SORTS in index.html.
@@ -44,10 +45,6 @@ def query_photos(params: dict[str, list[str]]) -> dict[str, Any]:
     require_all = first_value('match') == 'all'
     sort_key, descending = SORT_KEYS.get(first_value('sort') or '', SORT_KEYS['new'])
 
-    tag_counts: dict[str, int] = {}
-    for row in rows:
-        for tag in row['tags']:
-            tag_counts[tag] = tag_counts.get(tag, 0) + 1
     if wanted:
         combine = all if require_all else any
         matching = [row for row in rows if combine(tag in row['tags'] for tag in wanted)]
@@ -64,5 +61,5 @@ def query_photos(params: dict[str, list[str]]) -> dict[str, Any]:
         'page': page,
         'pages': pages,
         'size': size,
-        'tags': sorted(tag_counts.items(), key=lambda item: (-item[1], item[0])),
+        'tags': get_tag_index().ordered,  # cached; rebuilt only when photos.json or photos/ change
     }

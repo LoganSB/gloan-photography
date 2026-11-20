@@ -43,6 +43,15 @@ MAX_PAGE_SIZE = 100  # caps one response so a client cannot ask for the whole ga
 MAX_FILTER_TAGS = 30
 
 
+MAX_TAG_QUERY = 40  # tags are capped at 40 characters, so longer search text cannot match anything anyway
+
+
+DEFAULT_TAG_SUGGESTIONS = 8
+
+
+MAX_TAG_SUGGESTIONS = 20
+
+
 TOKEN_TTL = 12 * 3600
 
 

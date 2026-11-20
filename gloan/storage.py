@@ -1,6 +1,7 @@
-"""Photo index (photos.json) and image-file handling: validation, cleaning, scanning, persistence."""
+"""Photo index (photos.json) and image-file handling: validation, cleaning, scanning, persistence and caching."""
 
 import json
+import os
 import re
 import secrets
 import threading
@@ -58,18 +59,109 @@ def clean_tags(tags: list[Any]) -> list[str]:
 
 
 def load_index() -> list[Row]:
-    """Read the photo index; a missing file means an empty gallery."""
+    """Read the photo index from disk; a missing file means an empty gallery."""
     try:
-        return json.loads(INDEX_FILE.read_text())
+        return json.loads(INDEX_FILE.read_text(encoding='utf-8'))
     except FileNotFoundError:
         return []
 
 
+_index_generation = 0  # bumped on every save or file removal so in-process caches notice changes immediately
+
+
+def index_generation() -> int:
+    """How many times this process has modified photos.json or photo files; caches compare it to know when to rebuild."""
+    return _index_generation
+
+
+def bump_index_generation() -> None:
+    """Notify in-process caches (rows and tags) that files on disk were modified by this process."""
+    global _index_generation  # pylint: disable=global-statement  # deliberate change counter for caches
+    _index_generation += 1
+
+
 def save_index(rows: list[Row]) -> None:
     """Write-then-rename so a crash mid-write cannot leave a truncated index."""
-    tmp = INDEX_FILE.with_suffix('.tmp')
-    tmp.write_text(json.dumps(rows, indent=1))
-    tmp.replace(INDEX_FILE)
+    temporary_file = INDEX_FILE.with_suffix('.tmp')
+    temporary_file.write_text(json.dumps(rows, indent=1), encoding='utf-8')
+    temporary_file.replace(INDEX_FILE)
+    bump_index_generation()
+
+
+class RowsCache:
+    """In-memory snapshot of photos.json rows, photo file sizes and existing thumbnail filenames.
+
+    Why cache this: every GET /api/photos needs the list of valid photos, their byte sizes (for size sorting
+    and the public payload) and whether each photo has a tile in thumbs/. On a Cloud Storage FUSE mount each
+    per-file stat() is a network round trip. Reading photos.json once and scanning photos/ and thumbs/ with
+    os.scandir() reduces an entire rebuild to two directory reads, and subsequent requests do zero disk reads
+    until photos.json, photos/ or thumbs/ change.
+    """
+
+    def __init__(self) -> None:
+        photo_sizes: dict[str, int] = {}
+        try:
+            with os.scandir(PHOTO_DIR) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_file():
+                            photo_sizes[entry.name] = entry.stat().st_size
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+
+        thumb_names: set[str] = set()
+        try:
+            with os.scandir(THUMB_DIR) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_file():
+                            thumb_names.add(entry.name)
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+
+        self.photo_sizes = photo_sizes
+        self.thumb_names = thumb_names
+        # Orphan rows whose image file is missing are skipped silently and left in photos.json untouched.
+        self.rows: list[Row] = [
+            row for row in load_index()
+            if f'{row["id"]}.{row["ext"]}' in photo_sizes
+        ]
+
+
+_cache_lock = threading.Lock()
+_cached_rows: RowsCache | None = None
+_cached_signature: tuple | None = None
+
+
+def storage_signature() -> tuple:
+    """Cheap fingerprint of photos.json, photos/ and thumbs/ on disk plus the in-process generation counter."""
+    stats: list[tuple[int, int] | None] = []
+    for path in (INDEX_FILE, PHOTO_DIR, THUMB_DIR):
+        try:
+            info = path.stat()
+            stats.append((info.st_mtime_ns, info.st_size))
+        except OSError:
+            stats.append(None)
+    return (_index_generation, *stats)
+
+
+def get_rows_cache() -> RowsCache:
+    """Return the current RowsCache snapshot, rebuilding only when storage_signature() changes.
+
+    The signature is captured before reading disk so a concurrent modification during the build causes the
+    very next call to rebuild rather than caching stale data under a newer signature.
+    """
+    global _cached_rows, _cached_signature  # pylint: disable=global-statement  # module-level snapshot cache
+    signature = storage_signature()
+    with _cache_lock:
+        if _cached_rows is None or signature != _cached_signature:
+            _cached_rows = RowsCache()
+            _cached_signature = signature
+        return _cached_rows
 
 
 def scan_folder(skipped: list[str] | None = None) -> int:
@@ -93,8 +185,8 @@ def scan_folder(skipped: list[str] | None = None) -> int:
             if not path.is_file():
                 skipped.append(f'{path.name} (folder: photos must sit directly in photos/)')
                 continue
-            with path.open('rb') as fh:
-                ext = sniff_ext(fh.read(16))
+            with path.open('rb') as file_handle:
+                ext = sniff_ext(file_handle.read(16))
             if not ext:
                 skipped.append(f'{path.name} (not a jpeg/png/webp/gif)')
             else:
@@ -110,9 +202,13 @@ def scan_folder(skipped: list[str] | None = None) -> int:
 
 
 def file_size(row: Row) -> int:
-    """Size in bytes of a photo's file; 0 if the file is missing (callers normally filter those out first)."""
+    """Size in bytes of a photo's file from the cache (or 0 if the file is missing)."""
+    filename = f'{row["id"]}.{row["ext"]}'
+    cache = get_rows_cache()
+    if filename in cache.photo_sizes:
+        return cache.photo_sizes[filename]
     try:
-        return (PHOTO_DIR / f'{row["id"]}.{row["ext"]}').stat().st_size
+        return (PHOTO_DIR / filename).stat().st_size
     except OSError:
         return 0
 
@@ -120,7 +216,7 @@ def file_size(row: Row) -> int:
 def available_rows() -> list[Row]:
     """Index rows whose image file exists. Orphan rows are skipped silently (nothing shown, not counted) and
     left in photos.json untouched, so restoring the file, e.g. after a bucket hiccup, brings the photo back."""
-    return [row for row in load_index() if (PHOTO_DIR / f'{row["id"]}.{row["ext"]}').is_file()]
+    return [dict(row) for row in get_rows_cache().rows]
 
 
 def thumb_path(row: Row) -> Path | None:
@@ -131,8 +227,12 @@ def thumb_path(row: Row) -> Path | None:
     """
     name = row.get('thumb')
     match = THUMB_FILE_RE.match(name) if isinstance(name, str) else None
-    path = THUMB_DIR / name if match and match.group(1) == row['id'] else None
-    return path if path and path.is_file() else None
+    if not match or match.group(1) != row['id']:
+        return None
+    cache = get_rows_cache()
+    if name in cache.thumb_names or (THUMB_DIR / name).is_file():
+        return THUMB_DIR / name
+    return None
 
 
 def public_row(row: Row) -> Row:

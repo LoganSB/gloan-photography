@@ -10,6 +10,7 @@ services:
     volumes:
       - ./server.py:/app/server.py
       - ./gloan:/app/gloan
+      - ./static:/app/static
       - ./tools:/app/tools
       - ./tests:/app/tests
       - ./index.html:/app/index.html

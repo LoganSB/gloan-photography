@@ -5,10 +5,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Pillow is needed only by tools/make_thumbnails.py (the server itself is standard-library-only).
+# Install Flask + Gunicorn for the web server and Pillow for tools/make_thumbnails.py.
+COPY requirements.txt ./requirements.txt
 COPY tools/requirements.txt ./tools/requirements.txt
-RUN pip install --no-cache-dir -r tools/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt -r tools/requirements.txt
 COPY server.py index.html ./
+COPY static ./static
 COPY gloan ./gloan
 COPY tools ./tools
 

@@ -7,9 +7,20 @@ Read this file and [SYSTEMS.md](SYSTEMS.md) before changing anything.
 1. **Comment for humans.** Explain *why*, not just what. Every function gets a short docstring/comment. Comment tricky logic, security-relevant checks, and anything a person debugging would wonder about.
 2. **Meaningful names.** No single-letter or vague names (`x`, `tmp`, `data2`) except trivial loop indices. Names should say what the value is, including units where relevant (`timeout_seconds`).
 3. **Efficiency vs. readability.** Prefer efficient solutions, but readability is weighted heavily. Don't use a clever or obscure approach for a marginal speedup. If you do, comment why.
-4. **Keep it simple.** Server is standard-library-only Python; frontend is a single `index.html`. Do not add dependencies or build steps without asking the user.
+4. **Keep it simple.** The web server uses Flask + Gunicorn (`requirements.txt`); Pillow is used only by `tools/make_thumbnails.py`; the frontend is `index.html` + `static/app.css` + native ES modules in `static/*.js` (no bundler or build step). Do not add dependencies or build steps without asking the user.
 5. **Match existing style** in the file you edit. Don't reformat unrelated code.
 6. **Use Git Branches** for Significant changes or new features. Avoid directly modifying while on origin main except for small changes.
+
+## Tool & language review (every request)
+
+For each request, briefly consider whether another language, framework, library or tool would make the result more robust than extending the current stack, e.g. Flask (+ gunicorn) for the server, native ES modules or a small JS library for the frontend, SQLite, Playwright for browser tests.
+- Weigh robustness, security and readability against new dependencies, build steps and deploy changes (Cloud Run, one instance, data on a Cloud Storage FUSE mount).
+- State the conclusion in the response (one or two sentences is enough when the current stack is the right fit).
+- Only adopt something that adds a dependency, a build step or a rewrite after the user approves it; otherwise implement within the current stack and list the alternative as a suggestion.
+
+Current decisions (from the Nov 2026 project review; update when the user decides):
+- **Approved & implemented:** Flask + gunicorn (1 worker, 8 threads) replacing `http.server`; `index.html` split into `static/app.css` + native ES modules (`static/*.js`, no build step) with `Content-Security-Policy: script-src 'self'`; in-memory, `mtime`/generation-keyed `RowsCache` of `photos.json` rows and file sizes in `gloan/storage.py`.
+- **Rejected:** Generating thumbnails automatically at upload (owner runs thumbnail generation locally on demand to avoid Cloud Run CPU charges); jQuery (modern DOM APIs already cover it); React/Vue/Svelte or any bundler (build step not worth it at this size); SQLite as the store while data lives on Cloud Storage FUSE (no reliable file locking there).
 
 
 ## Interconnected systems (see [SYSTEMS.md](SYSTEMS.md))

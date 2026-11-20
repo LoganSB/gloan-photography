@@ -1,4 +1,4 @@
-"""Command-line entry point: flags, owner password and server start-up."""
+"""Command-line entry point: flags, owner password and Flask / Gunicorn server start-up."""
 
 import argparse
 import contextlib
@@ -8,12 +8,13 @@ import logging
 import os
 import signal
 import sys
-from http.server import ThreadingHTTPServer
 from typing import Any
+
+from werkzeug.serving import make_server
 
 from gloan.auth import Auth, normalize_ip
 from gloan.config import DATA, LOGGER, MIN_PASSWORD, PHOTO_DIR
-from gloan.handler import Handler
+from gloan.handler import Handler, app
 from gloan.storage import scan_folder
 
 
@@ -30,8 +31,49 @@ def get_password() -> str:
 
 
 def stop_on_sigterm(signum: int, frame: Any) -> None:
-    """Raise KeyboardInterrupt so serve_forever() unwinds the same way as for Ctrl+C."""
+    """Raise KeyboardInterrupt so the server loop unwinds cleanly on SIGTERM (e.g. Cloud Run shutdown)."""
     raise KeyboardInterrupt
+
+
+def _run_with_gunicorn(host: str, port: int) -> bool:
+    """Run the Flask app under Gunicorn (1 worker, 8 threads) when Gunicorn is available on Unix.
+
+    Why 1 worker: INDEX_LOCK, the login-failure map (FAILS), the thumbnail-job state and the in-memory caches
+    live in process memory, so a single multi-threaded worker keeps state consistent while serving concurrent
+    requests. When running under debugpy (VS Code F5 debugging) or on Windows, returns False so the caller
+    runs the single-process Werkzeug threaded server where breakpoints attach directly.
+    """
+    if 'debugpy' in sys.modules or os.name == 'nt':
+        return False
+    try:
+        from gunicorn.app.base import BaseApplication  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        return False
+
+    class StandaloneGunicornApp(BaseApplication):
+        """Embeds Gunicorn so `python3 server.py` and deploy.sh CLI flags work without a separate wrapper."""
+
+        def __init__(self, wsgi_app: Any, options: dict[str, Any]) -> None:
+            self.options = options
+            self.application = wsgi_app
+            super().__init__()
+
+        def load_config(self) -> None:
+            for key, value in self.options.items():
+                if key in self.cfg.settings and value is not None:
+                    self.cfg.set(key.lower(), value)
+
+        def load(self) -> Any:
+            return self.application
+
+    StandaloneGunicornApp(app, {
+        'bind': f'{host}:{port}',
+        'workers': 1,
+        'threads': 8,
+        'timeout': 120,
+        'accesslog': '-',
+    }).run()
+    return True
 
 
 def main() -> None:
@@ -69,11 +111,12 @@ def main() -> None:
     if adopted:
         LOGGER.info('Added %d photo(s) found in %s', adopted, PHOTO_DIR)
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
     LOGGER.info('Gloan on http://%s:%s (data: %s)', args.host, args.port, DATA)
     if Handler.owner_ips:
         LOGGER.info('Owner login allowed only from: %s', ', '.join(sorted(Handler.owner_ips)))
-    # Cloud Run stops instances with SIGTERM; turn it into the same clean exit as Ctrl+C.
-    signal.signal(signal.SIGTERM, stop_on_sigterm)
-    with contextlib.suppress(KeyboardInterrupt):
-        server.serve_forever()
+
+    if not _run_with_gunicorn(args.host, args.port):
+        server = make_server(args.host, args.port, app, threaded=True)
+        signal.signal(signal.SIGTERM, stop_on_sigterm)
+        with contextlib.suppress(KeyboardInterrupt):
+            server.serve_forever()
