@@ -15,13 +15,16 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from werkzeug.serving import BaseWSGIServer, make_server
 
 # Point GLOAN_DATA at an isolated temporary directory BEFORE importing gloan modules.
 TEST_DATA_DIR = Path(tempfile.mkdtemp(prefix='gloan_test_'))
 os.environ['GLOAN_DATA'] = str(TEST_DATA_DIR)
 
-from gloan.auth import Auth, FAILS, normalize_ip  # noqa: E402
+from gloan.auth import Auth, FAILS, b64url_decode, b64url_encode, normalize_ip  # noqa: E402
 from gloan.config import PHOTO_DIR, ROOT, THUMB_DIR  # noqa: E402
 from gloan.handler import Handler, app  # noqa: E402
 from gloan.storage import available_rows, get_rows_cache, load_index, save_index, sniff_ext  # noqa: E402
@@ -183,9 +186,17 @@ class FrontendSyntaxTest(unittest.TestCase):
         gallery_source = (static_dir / 'gallery.js').read_text(encoding='utf-8')
         self.assertIn('card-loader', gallery_source)
         self.assertIn('Loading image…', gallery_source)
+        self.assertIn("match: 'all'", gallery_source)
         lightbox_source = (static_dir / 'lightbox.js').read_text(encoding='utf-8')
         self.assertIn("classList.add('loading')", lightbox_source)
+        self.assertIn('pauseGalleryImageLoads()', lightbox_source)
+        self.assertIn('requestAnimationFrame(', lightbox_source)
         self.assertIn('withBusy(', lightbox_source)
+        self.assertIn('width:auto;height:auto;object-fit:contain', css_source)
+        search_source = (static_dir / 'search.js').read_text(encoding='utf-8')
+        self.assertIn('splitCommaInput(', search_source)
+        self.assertIn("event.key === 'Tab'", search_source)
+        self.assertIn("completedTerms.join(', ') + ', '", search_source)
 
         node_candidates = [shutil.which('node'), '/mnt/c/Program Files/nodejs/node.exe', 'C:/Program Files/nodejs/node.exe']
         node_binary = next((candidate for candidate in node_candidates if candidate and Path(candidate).exists()), None)
@@ -272,8 +283,10 @@ class TagSearchTest(unittest.TestCase):
         self.assertEqual(self.top('cafe'), ('café', 'exact'))
 
     def test_prefix_word_and_contains(self) -> None:
-        """Autocomplete prefix, start of a later word, and plain substring all match, in that order."""
-        self.assertEqual(self.top('mou'), ('mountain', 'prefix'))
+        """Autocomplete prefix, start of a later word, and plain substring all match, in that order (alphabetical ties)."""
+        self.assertEqual(self.top('mou'), ('mount-fuji', 'prefix'))
+        self.assertEqual(self.top('moun'), ('mount-fuji', 'prefix'))
+        self.assertEqual(self.top('mounta'), ('mountain', 'prefix'))
         self.assertEqual(self.top('subj'), ('single_subject', 'word'))
         self.assertEqual(self.top('unshi'), ('sunshine', 'contains'))
         kinds = [item['match'] for item in self.index.search('mount', 8)]
@@ -291,9 +304,18 @@ class TagSearchTest(unittest.TestCase):
         self.assertIsNone(self.top('zz'))
 
     def test_wildcards(self) -> None:
-        """'*' and '?' work shell-style against the whole tag."""
+        """'*' and '?' work shell-style against the whole tag, including prefix wildcards and comma-separated AND terms."""
         self.assertEqual(self.top('*shine'), ('sunshine', 'wildcard'))
         self.assertEqual(self.top('suns?t'), ('sunset', 'wildcard'))
+
+        # Predictive search on "bry" returns bryce_fall first alphabetically so Tab autofills "bryce_fall, ".
+        seasonal_index = TagIndex([
+            {'tags': ['bryce_summer', 'bryce_winter', 'bryce_fall', 'arches_summer', 'arches_winter']}
+        ])
+        bry_matches = [item['tag'] for item in seasonal_index.search('bry', 8)]
+        self.assertEqual(bry_matches, ['bryce_fall', 'bryce_summer', 'bryce_winter'])
+        wint_matches = [item['tag'] for item in seasonal_index.search('*wint', 8)]
+        self.assertEqual(wint_matches, ['arches_winter', 'bryce_winter'])
 
     def test_regex_input_is_literal_and_bounded(self) -> None:
         """Regex syntax in the query is matched literally (no injection) and very long text is harmless."""
@@ -347,7 +369,6 @@ class ServerAndApiTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         """Start the Flask WSGI server on an ephemeral localhost port."""
         Handler.auth = Auth('debugpassword')
-        Handler.owner_ips = frozenset()
         cls.server = make_server('127.0.0.1', 0, app, threaded=True)
         port = cls.server.server_port
         cls.base_url = f'http://127.0.0.1:{port}'
@@ -360,8 +381,11 @@ class ServerAndApiTest(unittest.TestCase):
         cls.server.server_close()
 
     def setUp(self) -> None:
-        """Reset the temporary data folder and login-failure map before each test."""
+        """Reset the temporary data folder, passkey state and login-failure map before each test."""
         FAILS.clear()
+        os.environ.pop('GLOAN_TURNSTILE_SITE_KEY', None)
+        os.environ.pop('GLOAN_TURNSTILE_SECRET_KEY', None)
+        Handler.auth = Auth('debugpassword')
         shutil.rmtree(TEST_DATA_DIR, ignore_errors=True)
         PHOTO_DIR.mkdir(parents=True, exist_ok=True)
         THUMB_DIR.mkdir(parents=True, exist_ok=True)
@@ -502,6 +526,67 @@ class ServerAndApiTest(unittest.TestCase):
         _, listing = self.api_call('/api/photos')
         self.assertEqual(listing['tags'], [['river', 1]])
 
+    def test_multi_tag_and_filtering_with_random_dataset(self) -> None:
+        """Generate a randomized synthetic photo dataset and verify AND chip filtering, comma-delimited search, and per-comma autocomplete."""
+        import random
+
+        rng = random.Random(42)
+        parks = ['bryce', 'arches', 'zion', 'canyonlands']
+        seasons = ['summer', 'winter', 'fall', 'spring']
+        extras = ['macro', 'sunrise', 'sunset', 'water', 'plants']
+
+        # Create 40 synthetic photos with compound tags (e.g. bryce_winter) and extra tags.
+        synthetic_rows = []
+        for idx in range(40):
+            photo_id = f'p{idx:016x}'
+            (PHOTO_DIR / f'{photo_id}.jpg').write_bytes(TINY_JPEG)
+            park = parks[idx % len(parks)]
+            season = seasons[(idx // len(parks)) % len(seasons)]
+            compound_tag = f'{park}_{season}'
+            chosen_extras = rng.sample(extras, k=2)
+            synthetic_rows.append({
+                'id': photo_id,
+                'ext': 'jpg',
+                'title': f'Photo {idx} {compound_tag}',
+                'tags': [compound_tag, *chosen_extras],
+                'story': '',
+                'added': 1700000000000 + idx * 1000,
+            })
+        save_index(synthetic_rows)
+
+        # 1. Tag chip selection below the search bar uses AND matching by default.
+        status, chip_and = self.api_call('/api/photos?tags=bryce_winter,macro&size=100')
+        self.assertEqual(status, 200)
+        expected_chip_ids = {
+            row['id'] for row in synthetic_rows if 'bryce_winter' in row['tags'] and 'macro' in row['tags']
+        }
+        self.assertEqual({photo['id'] for photo in chip_and['photos']}, expected_chip_ids)
+
+        # 2. Wildcard single-term search: q=*wint finds all bryce_winter, arches_winter, zion_winter, canyonlands_winter photos.
+        status, wint_res = self.api_call('/api/photos?q=*wint&size=100')
+        self.assertEqual(status, 200)
+        self.assertTrue(len(wint_res['photos']) > 0)
+        for photo in wint_res['photos']:
+            self.assertTrue(any('winter' in tag for tag in photo['tags']), photo['tags'])
+
+        # 3. Comma-separated multi-term search: q=*winter, bryce finds ONLY photos matching BOTH *winter AND bryce.
+        status, multi_res = self.api_call('/api/photos?q=*winter,+bryce&size=100')
+        self.assertEqual(status, 200)
+        expected_bryce_winter = {row['id'] for row in synthetic_rows if 'bryce_winter' in row['tags']}
+        self.assertEqual({photo['id'] for photo in multi_res['photos']}, expected_bryce_winter)
+
+        # 4. Predictive autocomplete on each comma segment:
+        #    - "bry" suggests "bryce_fall", "bryce_spring", "bryce_summer", "bryce_winter" in alphabetical order.
+        #    - "bryce_fall, *wint" suggests completions for the second segment ("*wint") while `matchingAll` intersects all terms.
+        _, seg1 = self.api_call('/api/tags?q=bry')
+        self.assertEqual([item['tag'] for item in seg1['suggestions']],
+                         ['bryce_fall', 'bryce_spring', 'bryce_summer', 'bryce_winter'])
+        _, seg2 = self.api_call('/api/tags?q=bryce_fall,+*wint')
+        self.assertEqual([item['tag'] for item in seg2['suggestions']],
+                         ['arches_winter', 'bryce_winter', 'canyonlands_winter', 'zion_winter'])
+        _, intersect = self.api_call('/api/tags?q=*winter,+bryce')
+        self.assertEqual([item['tag'] for item in intersect['matchingAll']], ['bryce_winter'])
+
     def test_auth_and_rescan_guard(self) -> None:
         """Unauthenticated calls to owner routes (upload, rescan, thumbnails) return 401 cleanly."""
         self.assertEqual(self.api_call('/api/photos', 'POST', TINY_JPEG)[0], 401)
@@ -515,6 +600,104 @@ class ServerAndApiTest(unittest.TestCase):
         status, scan_reply = self.api_call('/api/rescan', 'POST', b'', {'Authorization': f'Bearer {token}'})
         self.assertEqual(status, 200)
         self.assertEqual(scan_reply['added'], 1)
+
+    def test_passkey_webauthn_and_turnstile_and_debug_password_toggle(self) -> None:
+        """Verify WebAuthn Passkey registration + assertion login, Turnstile CAPTCHA check, and disabling password login."""
+        import hashlib
+        import struct
+
+        # 1. Generate a real ECDSA P-256 keypair (simulating the browser's hardware/OS Passkey authenticator).
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        spki_der = private_key.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        credential_id = b64url_encode(b'test-passkey-cred-id-1234')
+        rp_id = '127.0.0.1'
+        rp_id_hash = hashlib.sha256(rp_id.encode('utf-8')).digest()
+
+        # 2. Log in with debug password first to register the passkey.
+        debug_token = self.login_token()
+        auth_headers = {'Authorization': f'Bearer {debug_token}', 'Content-Type': 'application/json'}
+        status, reg_opts = self.api_call('/api/passkey/register/options', 'POST', b'', auth_headers)
+        self.assertEqual(status, 200)
+
+        reg_client_data = json.dumps({
+            'type': 'webauthn.create',
+            'challenge': reg_opts['challenge'],
+            'origin': self.base_url,
+        }).encode('utf-8')
+        reg_auth_data = rp_id_hash + bytes([0x05]) + struct.pack('>I', 1)  # UP + UV flags, signCount = 1
+        status, reg_reply = self.api_call('/api/passkey/register', 'POST', json.dumps({
+            'credentialId': credential_id,
+            'publicKey': b64url_encode(spki_der),
+            'clientDataJSON': b64url_encode(reg_client_data),
+            'authenticatorData': b64url_encode(reg_auth_data),
+        }).encode('utf-8'), auth_headers)
+        self.assertEqual(status, 200, reg_reply)
+        self.assertTrue(reg_reply.get('ok'))
+
+        # 3. Disable the debug password completely (production mode) and confirm /api/login returns 404.
+        Handler.auth = Auth('')
+        _, session_info = self.api_call('/api/session')
+        self.assertTrue(session_info['hasPasskey'])
+        self.assertFalse(session_info['debugPasswordEnabled'])
+        self.assertEqual(self.api_call('/api/login', 'POST',
+                                       json.dumps({'password': 'debugpassword'}).encode(),
+                                       {'Content-Type': 'application/json'})[0], 404)
+
+        # 4. Sign in using the WebAuthn Passkey assertion ceremony.
+        status, login_opts = self.api_call('/api/passkey/login/options', 'POST', b'')
+        self.assertEqual(status, 200)
+        self.assertEqual(login_opts['allowCredentials'][0]['id'], credential_id)
+
+        login_client_data = json.dumps({
+            'type': 'webauthn.get',
+            'challenge': login_opts['challenge'],
+            'origin': self.base_url,
+        }).encode('utf-8')
+        login_auth_data = rp_id_hash + bytes([0x05]) + struct.pack('>I', 2)  # signCount advances to 2
+        signed_payload = login_auth_data + hashlib.sha256(login_client_data).digest()
+        signature = private_key.sign(signed_payload, ec.ECDSA(hashes.SHA256()))
+
+        status, login_reply = self.api_call('/api/passkey/login', 'POST', json.dumps({
+            'credentialId': credential_id,
+            'clientDataJSON': b64url_encode(login_client_data),
+            'authenticatorData': b64url_encode(login_auth_data),
+            'signature': b64url_encode(signature),
+        }).encode('utf-8'), {'Content-Type': 'application/json'})
+        self.assertEqual(status, 200, login_reply)
+        passkey_token = login_reply['token']
+
+        # Token minted by passkey login grants owner access.
+        _, authed_session = self.api_call('/api/session', headers={'Authorization': f'Bearer {passkey_token}'})
+        self.assertTrue(authed_session['owner'])
+
+        # 5. Replaying with a non-advancing signCount (<= 2) or bad signature is rejected with 401.
+        status, login_opts2 = self.api_call('/api/passkey/login/options', 'POST', b'')
+        replay_client_data = json.dumps({
+            'type': 'webauthn.get',
+            'challenge': login_opts2['challenge'],
+            'origin': self.base_url,
+        }).encode('utf-8')
+        stale_auth_data = rp_id_hash + bytes([0x05]) + struct.pack('>I', 2)  # stale signCount = 2
+        stale_sig = private_key.sign(stale_auth_data + hashlib.sha256(replay_client_data).digest(),
+                                     ec.ECDSA(hashes.SHA256()))
+        status, _ = self.api_call('/api/passkey/login', 'POST', json.dumps({
+            'credentialId': credential_id,
+            'clientDataJSON': b64url_encode(replay_client_data),
+            'authenticatorData': b64url_encode(stale_auth_data),
+            'signature': b64url_encode(stale_sig),
+        }).encode('utf-8'), {'Content-Type': 'application/json'})
+        self.assertEqual(status, 401)
+
+        # 6. When Cloudflare Turnstile keys are set, missing captchaToken is rejected before checking credentials.
+        os.environ['GLOAN_TURNSTILE_SITE_KEY'] = 'site-key-123'
+        os.environ['GLOAN_TURNSTILE_SECRET_KEY'] = 'secret-key-456'
+        status, login_opts3 = self.api_call('/api/passkey/login/options', 'POST', b'')
+        status, err_reply = self.api_call('/api/passkey/login', 'POST', json.dumps({
+            'credentialId': credential_id,
+            'captchaToken': '',
+        }).encode('utf-8'), {'Content-Type': 'application/json'})
+        self.assertEqual(status, 401)
+        self.assertIn('captcha', err_reply.get('error', ''))
 
 
 if __name__ == '__main__':

@@ -16,7 +16,7 @@ python3 server.py
 
 It asks you to choose an owner password (8+ characters, not shown as you type).
 When it prints `Gloan on http://127.0.0.1:8000`, open that address in
-your browser, click **Owner login**, enter the password, and upload. Visitors
+your browser, click **Admin login**, enter the password, and upload. Visitors
 can browse, filter and play the slideshow but cannot change anything.
 Stop the server with `Ctrl+C`; the password is asked for again next start.
 
@@ -28,14 +28,18 @@ Env: `GLOAN_DATA` moves the storage folder (default `./data`).
 
 ## Who can log in
 
-Anyone who knows the owner password. Login attempts are limited (5 wrong tries from one address locks it out for
-a minute) and sessions expire after 12 hours, but the password is the only protection, so make it long (12+
-characters).
+Owner authentication uses **WebAuthn Passkeys (FIDO2)** (TouchID / FaceID / Windows Hello / YubiKey) protected by
+**Cloudflare Turnstile** bot CAPTCHA (when `GLOAN_TURNSTILE_SITE_KEY` and `GLOAN_TURNSTILE_SECRET_KEY` are set) and
+IP failure lockout (5 failures = 60s lockout). Your private key never leaves your device; only the ES256 public key
+and credential ID are stored in `data/passkey.json`.
 
-Optionally restrict owner login to specific addresses with `--owner-ip IP` (repeatable). Then the **Owner login**
-button is hidden from everyone else, the login route answers 404, and a stolen token is rejected from other
-addresses. Behind a proxy, also pass `--proxy-header X-Forwarded-For`; it is trusted only from the same machine
-(or from any peer with `--proxy-any-peer`), and the last entry is used.
+**Initial Passkey enrollment & debug password workaround:**
+While `GLOAN_PASSWORD` is set in the environment (such as `debugpassword` in local Docker debugging, or on your first
+Cloud Run deployment), the login modal also shows a temporary debug password box. Log in once with that password,
+click **Register Passkey** in the footer, and complete your browser's Passkey prompt. Once `data/passkey.json` exists
+and you have verified signing in with your Passkey, unset `GLOAN_PASSWORD` (or remove the marked
+`DEBUG PASSWORD WORKAROUND` block in `gloan/auth.py`, `gloan/handler.py` and `static/app.js`) to disable password
+authentication completely.
 
 ## Data
 
@@ -48,11 +52,15 @@ Back up the `data/` folder and you have everything.
 
 ## Searching tags
 
-The search box above the tag chips suggests tags as you type; pick one to add it as a filter. Matching ignores
-case, accents and the difference between spaces, `_` and `-`, and finds tags by prefix, by the start of any word
-(`subj` finds `single_subject`) or anywhere inside. From 3 characters on, one typo is forgiven (a wrong, missing,
-extra or swapped letter). `*` and `?` work as wildcards (`*shine`, `suns?t`). The tag list is cached on the server
-and rebuilt only when `photos.json` or the photos folder changes.
+The search box above the tag chips filters the gallery live and suggests tags as you type:
+- **AND matching everywhere:** clicking multiple tag chips below the search bar or entering comma-separated terms in
+  the search box requires photos to match **all** selected/searched tags.
+- **Tab autofill & per-comma predictions:** typing `bry` suggests matching tags in alphabetical order (`bryce_fall`,
+  `bryce_summer`, `bryce_winter`, …). Pressing **Tab** (or clicking a suggestion) completes the current term with a
+  trailing comma (`bryce_fall, `) and immediately opens predictive suggestions for the next comma-separated term.
+- **Wildcards & typos:** matching ignores case, accents and spaces/`_`/`-`; `*` and `?` work as wildcards (`*wint`
+  matches `bryce_winter` and `arches_winter`; `*winter, bryce` matches only `bryce_winter`); and from 3 characters on,
+  one typo is forgiven.
 
 ## Putting it online
 
@@ -66,7 +74,9 @@ network in the clear.
 |---|---|---|
 | GET | `/api/photos?page=0&size=10&sort=new&tags=a,b&match=any` (one page of photos, each with `added` ms timestamp and `size` bytes, plus `total`, `all`, `pages` and gallery-wide `tags` counts; `size` max 100; `sort` is `new`, `old`, `az`, `za`, `big` or `small`; `match` is `any` or `all`), `/photos/<id>.<ext>`, `/api/session` | public |
 | GET | `/api/tags?q=text&limit=8` (tag suggestions, best first: `[{tag, count, match}]` where `match` is `exact`, `prefix`, `word`, `contains`, `wildcard`, `fuzzy` or `popular`; `limit` max 20) | public |
-| POST | `/api/login` `{"password"}` -> `{"token"}` | public (5 failures = 60s lockout) |
+| POST | `/api/passkey/login/options`, `/api/passkey/login` (WebAuthn Passkey assertion + Turnstile `captchaToken`) -> `{"token"}` | public (5 failures = 60s lockout) |
+| POST | `/api/passkey/register/options`, `/api/passkey/register` (stores ES256 public key in `data/passkey.json`) | owner (or first-time setup) |
+| POST | `/api/login` `{"password","captchaToken"}` -> `{"token"}` *(debug workaround only; 404 when `GLOAN_PASSWORD` unset)* | public (5 failures = 60s lockout) |
 | GET | `/thumbs/<id>.jpg` | public |
 | GET | `/api/thumbnails` (job status: `running`, `exitCode`, `output`, `missing`) | owner |
 | POST | `/api/thumbnails` (starts `tools/make_thumbnails.py` in the background) | owner |

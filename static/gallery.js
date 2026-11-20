@@ -22,7 +22,8 @@ export const PAGE_SIZES = [10, 20, 50];
 export const state = {
   ready: false,
   activeTags: new Set(),
-  matchAll: false,
+  searchQuery: '',
+  matchAll: true,
   layout: localStorage.getItem('gloan-layout') || 'masonry',
   view: [],
   filteredTotal: 0,
@@ -35,8 +36,34 @@ export const state = {
   suggestionCache: new Map(),
 };
 
-let imageLoadRun = 0;  // bumped on every render so a superseded sequential loader stops itself
+let imageLoadRun = 0;  // bumped on every render or lightbox open so a sequential tile load yields immediately
+let activeTileImage = null; // the tile <img> currently downloading, so openLightbox can abort it and free sockets
+let currentGalleryEl = null;
 let refreshRun = 0;    // bumped per fetch so a slow, outdated response cannot overwrite a newer one
+
+/**
+ * Abort any in-flight sequential tile download so a lightbox full-resolution image request never waits in the
+ * browser's per-origin TCP socket queue behind a slow un-thumbnailed image.
+ */
+export function pauseGalleryImageLoads() {
+  imageLoadRun++;
+  if (activeTileImage && !activeTileImage.complete) {
+    const cancelHandler = activeTileImage.onerror;
+    activeTileImage.onload = activeTileImage.onerror = null;
+    activeTileImage.removeAttribute('src');
+    if (typeof cancelHandler === 'function') cancelHandler();
+  }
+  activeTileImage = null;
+}
+
+/**
+ * Resume sequential loading for any remaining unloaded cards on the current page after the lightbox closes.
+ */
+export function resumeGalleryImageLoads() {
+  if (currentGalleryEl) {
+    loadImagesInOrder(currentGalleryEl);
+  }
+}
 
 let cardHandlers = {
   openLightbox: () => {},
@@ -68,8 +95,9 @@ export async function fetchPage() {
     page: state.page,
     size: state.pageSize,
     sort: state.sortKey,
-    match: state.matchAll ? 'all' : 'any',
+    match: 'all',
     tags: [...state.activeTags].join(','),
+    q: state.searchQuery,
   };
   const reply = await API.list(query);
   if (runId !== refreshRun) return false; // a newer request superseded this one
@@ -165,13 +193,19 @@ export async function loadImagesInOrder(galleryElement) {
     return rowA - rowB || colA - colB;
   });
   for (const card of cards) {
-    if (runId !== imageLoadRun) return; // superseded by a newer render
+    if (runId !== imageLoadRun) return; // superseded by a newer render or paused by openLightbox
+    if (card.classList.contains('loaded')) continue;
     const image = card.querySelector('img');
+    activeTileImage = image;
     await new Promise(done => {
-      image.onload = image.onerror = done;
+      image.onload = () => {
+        card.classList.add('loaded');
+        done();
+      };
+      image.onerror = done;
       image.src = image.dataset.src;
     });
-    card.classList.add('loaded');
+    activeTileImage = null;
   }
 }
 
@@ -185,9 +219,12 @@ export function render() {
 
   const filtersBar = select('#filters');
   filtersBar.innerHTML = '';
-  const allChip = createElement('button', 'chip' + (state.activeTags.size ? '' : ' on'), `All<small>${state.photoTotal}</small>`);
+  const allChip = createElement('button', 'chip' + (state.activeTags.size || state.searchQuery ? '' : ' on'), `All<small>${state.photoTotal}</small>`);
   allChip.onclick = () => {
     state.activeTags.clear();
+    state.searchQuery = '';
+    const searchInput = select('#tagSearch');
+    if (searchInput) searchInput.value = '';
     state.page = 0;
     refresh();
   };
@@ -214,7 +251,6 @@ export function render() {
     .join('');
   modeBar.innerHTML = `<select class="sel" id="sortSel" title="Sort by">${sortOptions}</select>
    <select class="sel" id="sizeSel" title="Photos per page">${sizeOptions}</select>
-   <div class="seg" title="Tag matching"><button data-m="any" class="${state.matchAll ? '' : 'on'}">Any</button><button data-m="all" class="${state.matchAll ? 'on' : ''}">All</button></div>
    <div class="seg"><button data-l="masonry" class="${state.layout === 'masonry' ? 'on' : ''}">Masonry</button><button data-l="uniform" class="${state.layout === 'uniform' ? 'on' : ''}">Grid</button></div>`;
 
   modeBar.querySelector('#sortSel').onchange = event => {
@@ -229,13 +265,6 @@ export function render() {
     state.page = 0;
     refresh();
   };
-  modeBar.querySelectorAll('[data-m]').forEach(button => {
-    button.onclick = () => {
-      state.matchAll = button.dataset.m === 'all';
-      state.page = 0;
-      refresh();
-    };
-  });
   modeBar.querySelectorAll('[data-l]').forEach(button => {
     button.onclick = () => {
       state.layout = button.dataset.l;
@@ -286,6 +315,7 @@ export function render() {
     galleryEl.append(card);
   });
 
+  currentGalleryEl = galleryEl;
   host.append(galleryEl);
   host.append(buildPager());
   loadImagesInOrder(galleryEl); // intentionally unawaited so cards stream in while UI stays responsive

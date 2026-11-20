@@ -5,7 +5,7 @@
 let onOwnerChangedCallback = null;
 
 /**
- * Register a callback invoked whenever owner login state changes so the gallery can re-render.
+ * Register a callback invoked whenever Admin login state changes so the gallery can re-render.
  */
 export function registerOwnerRenderCallback(callback) {
   onOwnerChangedCallback = callback;
@@ -100,7 +100,7 @@ export function setOwner(enabled, shouldRender = true) {
   document.body.classList.toggle('owner', enabled);
   select('#authBtn').innerHTML = enabled
     ? '🔓 <span class="lbl">Log out</span>'
-    : '🔒 <span class="lbl">Owner login</span>';
+    : '🔒 <span class="lbl">Admin login</span>';
   if (shouldRender && onOwnerChangedCallback) {
     onOwnerChangedCallback();
   }
@@ -154,9 +154,31 @@ export const API = {
     return this.call('GET', '/api/tags?' + new URLSearchParams({ q: query, limit }));
   },
 
-  login(password) {
+  login(password, captchaToken = '') {
     return this.call('POST', '/api/login', {
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({ password, captchaToken }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+  },
+
+  passkeyRegisterOptions() {
+    return this.call('POST', '/api/passkey/register/options');
+  },
+
+  passkeyRegister(payload) {
+    return this.call('POST', '/api/passkey/register', {
+      body: JSON.stringify(payload),
+      headers: { 'Content-Type': 'application/json' },
+    });
+  },
+
+  passkeyLoginOptions() {
+    return this.call('POST', '/api/passkey/login/options');
+  },
+
+  passkeyLogin(payload) {
+    return this.call('POST', '/api/passkey/login', {
+      body: JSON.stringify(payload),
       headers: { 'Content-Type': 'application/json' },
     });
   },

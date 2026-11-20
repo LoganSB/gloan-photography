@@ -2,32 +2,27 @@
 
 import argparse
 import contextlib
-import getpass
-import ipaddress
 import logging
 import os
 import signal
-import sys
 from typing import Any
 
 from werkzeug.serving import make_server
 
-from gloan.auth import Auth, normalize_ip
-from gloan.config import DATA, LOGGER, MIN_PASSWORD, PHOTO_DIR
+from gloan.auth import Auth
+from gloan.config import DATA, LOGGER, PHOTO_DIR
 from gloan.handler import Handler, app
 from gloan.storage import scan_folder
 
 
-def get_password() -> str:
-    """Owner password from GLOAN_PASSWORD if set, otherwise prompted for on the terminal (not echoed)."""
-    password = os.environ.get('GLOAN_PASSWORD', '')
-    while len(password) < MIN_PASSWORD:
-        if not sys.stdin.isatty():
-            sys.exit(f'Set GLOAN_PASSWORD to a password of at least {MIN_PASSWORD} characters.')
-        if password:
-            print(f'That was only {len(password)} characters - please use at least {MIN_PASSWORD}.')
-        password = getpass.getpass('Choose an owner password (you will use it to log in on the site): ')
-    return password
+# ============================================================================
+# DEBUG PASSWORD WORKAROUND (REMOVE AFTER CLOUD PASSKEY VERIFICATION)
+# Reads GLOAN_PASSWORD from the environment if set. When unset or empty,
+# password authentication is completely disabled and only Passkey login works.
+# ============================================================================
+def get_debug_password() -> str:
+    """Optional debug password from GLOAN_PASSWORD; '' disables password login completely."""
+    return os.environ.get('GLOAN_PASSWORD', '').strip()
 
 
 def stop_on_sigterm(signum: int, frame: Any) -> None:
@@ -43,7 +38,7 @@ def _run_with_gunicorn(host: str, port: int) -> bool:
     requests. When running under debugpy (VS Code F5 debugging) or on Windows, returns False so the caller
     runs the single-process Werkzeug threaded server where breakpoints attach directly.
     """
-    if 'debugpy' in sys.modules or os.name == 'nt':
+    if 'debugpy' in os.environ.get('PYTHONPATH', '') or 'debugpy' in str(os.environ.get('_', '')) or os.name == 'nt':
         return False
     try:
         from gunicorn.app.base import BaseApplication  # pylint: disable=import-outside-toplevel
@@ -77,14 +72,12 @@ def _run_with_gunicorn(host: str, port: int) -> bool:
 
 
 def main() -> None:
-    """Parse flags, require the owner password, and serve until interrupted."""
+    """Parse flags and serve until interrupted."""
     parser = argparse.ArgumentParser(description='Gloan photo gallery server')
     # Loopback by default: exposing the site is a deliberate choice (--host 0.0.0.0 or a reverse proxy).
     parser.add_argument('--host', default='127.0.0.1')
     # Cloud Run (and most PaaS) hand the listening port over in $PORT.
     parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', '8000')))
-    parser.add_argument('--owner-ip', action='append', metavar='IP',
-                        help='only allow owner login from this address; repeatable (default: any address)')
     parser.add_argument('--proxy-header', metavar='NAME',
                         help='trust this header (e.g. X-Forwarded-For) for the client IP when behind a local proxy')
     parser.add_argument('--proxy-hops', type=int, default=1, metavar='N',
@@ -95,25 +88,16 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 
-    owner_ips = [normalize_ip(ip) for ip in (args.owner_ip or [])]
-    for ip in owner_ips:
-        try:
-            ipaddress.ip_address(ip)
-        except ValueError:
-            sys.exit(f'--owner-ip {ip!r} is not a valid IP address.')
-    Handler.owner_ips = frozenset(owner_ips)
     Handler.proxy_header = args.proxy_header
     Handler.proxy_hops = max(1, args.proxy_hops)
     Handler.proxy_any_peer = args.proxy_any_peer
-    Handler.auth = Auth(get_password())
+    Handler.auth = Auth(get_debug_password())
     PHOTO_DIR.mkdir(parents=True, exist_ok=True)
     adopted = scan_folder()
     if adopted:
         LOGGER.info('Added %d photo(s) found in %s', adopted, PHOTO_DIR)
 
     LOGGER.info('Gloan on http://%s:%s (data: %s)', args.host, args.port, DATA)
-    if Handler.owner_ips:
-        LOGGER.info('Owner login allowed only from: %s', ', '.join(sorted(Handler.owner_ips)))
 
     if not _run_with_gunicorn(args.host, args.port):
         server = make_server(args.host, args.port, app, threaded=True)

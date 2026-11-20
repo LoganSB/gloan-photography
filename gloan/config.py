@@ -25,6 +25,10 @@ INDEX_FILE = DATA / 'photos.json'
 THUMB_DIR = DATA / 'thumbs'
 
 
+PASSKEY_FILE = DATA / 'passkey.json'
+SESSION_KEY_FILE = DATA / 'session.key'
+
+
 MIN_PASSWORD = 8
 
 

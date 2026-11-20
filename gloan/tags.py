@@ -85,9 +85,15 @@ def wildcard_regex(key: str) -> re.Pattern[str]:
 
 
 def classify_match(entry_key: str, key: str) -> str | None:
-    """Best way `entry_key` (a normalised tag) matches the normalised query `key`, or None for no match."""
+    """Best way `entry_key` (a normalised tag) matches the normalised query `key`, or None for no match.
+
+    When `key` contains '*' or '?', wildcards match anywhere from `key` unless the caller explicitly anchored
+    the end with '?'; trailing characters after a prefix pattern (e.g. `*wint` matching `bryce-winter`) are
+    allowed automatically so typing a partial wildcard still autocompletes cleanly.
+    """
     if '*' in key or '?' in key:
-        return 'wildcard' if wildcard_regex(key).fullmatch(entry_key) else None
+        pattern = key if key.endswith('*') else key + '*'
+        return 'wildcard' if wildcard_regex(pattern).fullmatch(entry_key) else None
     result = None
     if entry_key == key:
         result = 'exact'
@@ -100,6 +106,38 @@ def classify_match(entry_key: str, key: str) -> str | None:
     elif len(key) >= FUZZY_MIN_LENGTH and fuzzy_regex(key).search(entry_key):
         result = 'fuzzy'
     return result
+
+
+def parse_query_terms(query: str) -> list[str]:
+    """Split a comma-separated search query into normalised non-empty search keys.
+
+    Allows multi-term intersection queries like `*winter, bryce`, where every comma-separated term must match
+    the candidate tag.
+    """
+    raw_parts = query[:MAX_TAG_QUERY * 4].split(',')
+    terms: list[str] = []
+    for part in raw_parts[:8]:
+        term = search_key(part[:MAX_TAG_QUERY])
+        if term and term not in terms:
+            terms.append(term)
+    return terms
+
+
+def classify_multi_match(entry_key: str, terms: list[str]) -> str | None:
+    """Match `entry_key` against ALL comma-separated `terms`; return the weakest match label or None if any fails."""
+    if not terms:
+        return None
+    worst_rank = -1
+    worst_label: str | None = None
+    for term in terms:
+        match = classify_match(entry_key, term)
+        if not match:
+            return None
+        rank = MATCH_RANKS[match]
+        if rank > worst_rank:
+            worst_rank = rank
+            worst_label = match
+    return worst_label
 
 
 class TagIndex:
@@ -122,7 +160,7 @@ class TagIndex:
         self._results_lock = threading.Lock()
 
     def search(self, query: str, limit: int) -> list[dict[str, Any]]:
-        """Up to `limit` suggestions for `query`, best match first; repeat queries come from the result cache."""
+        """Up to `limit` suggestions for the single active comma-delimited token `query`, best match first."""
         key = search_key(query[:MAX_TAG_QUERY])
         cache_key = (key, limit)
         with self._results_lock:
@@ -136,7 +174,7 @@ class TagIndex:
         return cached
 
     def _rank(self, key: str, limit: int) -> list[dict[str, Any]]:
-        """Match every tag against `key` and order by match quality, then popularity, then name."""
+        """Match every tag against `key` and order by match quality, then alphabetical tag name."""
         if not key:
             return [{'tag': tag, 'count': count, 'match': 'popular'} for _, tag, count in self.entries[:limit]]
         matches = []
@@ -144,9 +182,44 @@ class TagIndex:
             match = classify_match(entry_key, key)
             if match:
                 matches.append({'tag': tag, 'count': count, 'match': match})
-        # entries are already in popularity order and sort() is stable, so ties keep that order.
-        matches.sort(key=lambda item: MATCH_RANKS[item['match']])
+        # Order non-empty search matches by match rank first, then alphabetically by tag name so Tab autofill
+        # predictably completes the alphabetically-first matching tag (e.g. "bry" -> "bryce_fall,").
+        matches.sort(key=lambda item: (MATCH_RANKS[item['match']], item['tag'].lower()))
         return matches[:limit]
+
+    def matching_tags_for_term(self, term_query: str) -> set[str]:
+        """Set of all tag names in the gallery that match a single search term (exact/prefix/word/wildcard/fuzzy)."""
+        key = search_key(term_query[:MAX_TAG_QUERY])
+        if not key:
+            return set()
+        return {tag for entry_key, tag, _ in self.entries if classify_match(entry_key, key) is not None}
+
+
+def row_matches_tag_term(row: Row, term_query: str) -> bool:
+    """True when `row` has at least one tag that matches `term_query` (using exact, prefix, wildcard or fuzzy rules)."""
+    key = search_key(term_query[:MAX_TAG_QUERY])
+    if not key:
+        return True
+    for tag in row.get('tags', []):
+        if classify_match(search_key(tag), key) is not None:
+            return True
+    return False
+
+
+def row_matches_all_tag_terms(row: Row, raw_terms: list[str]) -> bool:
+    """True when `row` satisfies EVERY comma-separated tag filter/search term (AND matching).
+
+    Wait: what if a single photo has ONE compound tag like `bryce_winter` and the user searches `*winter, bryce`,
+    OR a photo has two separate tags `['bryce', 'winter']` and the user searches `*winter, bryce`?
+    Because `row_matches_tag_term(row, term)` checks whether the photo has ANY tag matching `term`, and we require
+    `all(row_matches_tag_term(row, term) for term in terms)`:
+    - A photo with `['bryce_winter']` matches `*winter` (via `bryce_winter`) AND matches `bryce` (via `bryce_winter`)!
+    - A photo with `['bryce', 'winter']` matches `*winter` (via `winter`) AND matches `bryce` (via `bryce`)!
+    - A photo with `['arches_winter']` matches `*winter`, but fails `bryce`!
+    - A photo with `['bryce_summer']` matches `bryce`, but fails `*winter`!
+    So both compound tags (`bryce_winter`) and separate multi-tags (`bryce` + `winter`) work seamlessly under AND!
+    """
+    return all(row_matches_tag_term(row, term) for term in raw_terms if search_key(term))
 
 
 _cache_lock = threading.Lock()  # guards the two globals below across handler threads
@@ -187,5 +260,28 @@ def get_tag_index() -> TagIndex:
 
 
 def suggest_tags(query: str, limit: int) -> dict[str, Any]:
-    """Reply body for GET /api/tags: the normalised query and its ranked suggestions."""
-    return {'query': search_key(query[:MAX_TAG_QUERY]), 'suggestions': get_tag_index().search(query, limit)}
+    """Reply body for GET /api/tags: suggestions for the active (last) comma-separated segment of `query`.
+
+    When `query` has multiple comma-separated terms (e.g. `*winter, bryce`) and the caller also wants to know
+    which tags match ALL terms simultaneously, `matchingAll` lists the tags matching every term while `suggestions`
+    autocompletes the active segment after the last comma.
+    """
+    segments = query[:MAX_TAG_QUERY * 4].split(',')
+    active_segment = segments[-1]
+    index = get_tag_index()
+    suggestions = index.search(active_segment, limit)
+    terms = parse_query_terms(query)
+    if len(terms) > 1:
+        matching_all = [
+            {'tag': tag, 'count': count, 'match': classify_multi_match(entry_key, terms)}
+            for entry_key, tag, count in index.entries
+            if classify_multi_match(entry_key, terms) is not None
+        ]
+        matching_all.sort(key=lambda item: (MATCH_RANKS[item['match']], item['tag'].lower()))
+    else:
+        matching_all = suggestions
+    return {
+        'query': search_key(active_segment[:MAX_TAG_QUERY]),
+        'suggestions': suggestions,
+        'matchingAll': matching_all[:limit],
+    }

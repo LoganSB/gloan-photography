@@ -43,6 +43,9 @@ Never consider a change complete until all of the following pass:
 2. **Full Docker build & runtime check:**
    - Bring up the debug container (`docker compose -f docker-compose.debug.yml up -d --build`), run the unit test suite *inside* the container (`docker exec gloan-debug python3 -m unittest discover -s tests -v`, which exercises Pillow and `tools/make_thumbnails.py`), and verify the live HTTP endpoints (`GET /`, `GET /api/session`, `GET /api/photos`) return `200`.
    - Verify the production image builds cleanly (`docker build -t gloan-test .`).
+3. **Synthetic & randomly generated test data for troubleshooting:**
+   - When building or troubleshooting search, filtering, pagination, sorting, or storage behavior, generate realistic randomized/combinatorial test datasets inside `tests/test_gloan.py` (or a scratch directory under `TEST_DATA_DIR`) to exercise edge cases, multi-tag combinations, wildcards, typos, and pagination boundaries.
+   - Keep generated datasets reasonable in size (e.g. tens to a few hundred synthetic photos/rows and tiny valid image headers, never gigabytes or terabytes of files/text) and always clean up temporary test directories in `tearDown` / `tearDownModule`.
 
 **Avoid infinite improvement loops:**
 - Follow links **one hop only**. Updates made *because of* a link are mechanical sync fixes; do not then re-trigger the link check from those files.
@@ -52,7 +55,7 @@ Never consider a change complete until all of the following pass:
 
 ## Security
 
-Treat this as a public, internet-facing site with an owner login and file uploads.
+Treat this as a public, internet-facing site with an Admin login and file uploads.
 - When reading or writing code, watch for: auth/session flaws, path traversal, unsafe upload handling (type, size, filenames), XSS/HTML injection in the frontend, header/proxy trust (`X-Forwarded-For`), secrets in code or logs, missing rate limits, and plain-HTTP exposure.
 - **If you spot a potential flaw, tell the user** with where it is, the risk, and a suggested fix, and ask before making sweeping security changes. Do not silently ignore it, and do not silently expand scope.
 - Never commit real passwords or secrets. `debugpassword` is for local Docker debugging only.

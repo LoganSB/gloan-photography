@@ -10,7 +10,18 @@ from urllib.parse import parse_qs, unquote
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 from werkzeug.exceptions import HTTPException
 
-from gloan.auth import Auth, FAILS, normalize_ip
+from gloan.auth import (
+    Auth,
+    FAILS,
+    has_passkey,
+    issue_webauthn_challenge,
+    load_passkey,
+    normalize_ip,
+    register_passkey_credential,
+    turnstile_site_key,
+    verify_passkey_assertion,
+    verify_turnstile,
+)
 from gloan.config import (
     DEFAULT_TAG_SUGGESTIONS,
     FILE_RE,
@@ -45,15 +56,16 @@ from gloan.thumbtool import start_thumbnail_job, thumbnail_status
 
 
 # Strict Content-Security-Policy enabled by moving all CSS and JavaScript out of index.html into /static/.
-# - script-src 'self' blocks any injected inline <script>, event-handler attributes, or external scripts.
+# - script-src & frame-src allow 'self' plus https://challenges.cloudflare.com for the Cloudflare Turnstile widget.
 # - img-src allows 'self' plus blob: (used by URL.createObjectURL upload previews) and data:.
 # - style-src allows 'self' and 'unsafe-inline' so JS can update element.style.width/transform for progress bars & card tilt.
 CONTENT_SECURITY_POLICY = (
     "default-src 'self'; "
-    "script-src 'self'; "
+    "script-src 'self' https://challenges.cloudflare.com; "
     "style-src 'self' 'unsafe-inline'; "
     "img-src 'self' blob: data:; "
-    "connect-src 'self'; "
+    "connect-src 'self' https://challenges.cloudflare.com; "
+    "frame-src https://challenges.cloudflare.com; "
     "object-src 'none'; "
     "base-uri 'self'; "
     "frame-ancestors 'none'"
@@ -68,7 +80,6 @@ class Handler:
 
     server_version = 'Gloan/1.0'
     auth: Auth = Auth('debugpassword')
-    owner_ips: frozenset[str] = frozenset()  # empty = no address restriction
     proxy_header: str | None = None
     proxy_hops: int = 1
     proxy_any_peer: bool = False
@@ -105,20 +116,15 @@ def client_ip() -> str:
     return peer
 
 
-def can_login() -> bool:
-    """True when this request comes from an address allowed to be the owner."""
-    return not Handler.owner_ips or client_ip() in Handler.owner_ips
-
-
 def is_owner() -> bool:
-    """True for a valid owner token from an allowed address, so a leaked token is useless elsewhere."""
+    """True for a valid signed owner bearer token."""
     header = request.headers.get('Authorization', '')
-    return header.startswith('Bearer ') and can_login() and Handler.auth.verify(header[7:])
+    return header.startswith('Bearer ') and Handler.auth.verify(header[7:])
 
 
 def require_owner() -> Response | None:
     """Return None when the requester is the authenticated owner, or a 401 Response to abort with."""
-    return None if is_owner() else fail(401, 'owner login required')
+    return None if is_owner() else fail(401, 'Admin login required')
 
 
 def read_body(limit: int) -> tuple[bytes | None, Response | None]:
@@ -199,8 +205,14 @@ def serve_photo(filename: str) -> Response:
 
 @app.get('/api/session')
 def api_session() -> Response:
-    """Report whether the caller is currently logged in and whether login is allowed from their IP."""
-    return jsonify({'owner': is_owner(), 'canLogin': can_login()})
+    """Report whether the caller is logged in, whether a passkey exists, Turnstile site key and debug password mode."""
+    return jsonify({
+        'owner': is_owner(),
+        'hasPasskey': has_passkey(),
+        'turnstileSiteKey': turnstile_site_key(),
+        # DEBUG WORKAROUND FLAG: remove once passkey is verified in production and debug password is retired
+        'debugPasswordEnabled': Handler.auth.debug_password_enabled,
+    })
 
 
 @app.get('/api/photos')
@@ -254,29 +266,135 @@ def api_rescan() -> Response:
     return jsonify({'added': added, 'skipped': skipped[:10], 'indexed': indexed_count})
 
 
-@app.post('/api/login')
-def api_login() -> Response:
-    """Exchange the owner password for a signed token, locking out an IP after repeated failures."""
-    if not can_login():
-        return fail(404, 'not found')  # indistinguishable from a route that does not exist
-    requester_ip = client_ip()
-    count, locked_until = FAILS.get(requester_ip, (0, 0.0))
+def _check_rate_limit(requester_ip: str) -> Response | None:
+    """Return a 429 error response if `requester_ip` is currently locked out after repeated login failures."""
+    _, locked_until = FAILS.get(requester_ip, (0, 0.0))
     if locked_until > time.time():
         return fail(429, 'too many attempts, try again shortly')
+    return None
+
+
+def _record_login_failure(requester_ip: str, message: str = 'authentication failed') -> Response:
+    """Increment the failure counter for `requester_ip`, lock out at MAX_FAILS, and return a 401 response."""
+    count, _ = FAILS.get(requester_ip, (0, 0.0))
+    count += 1
+    FAILS[requester_ip] = (count, time.time() + LOCK_SECONDS if count >= MAX_FAILS else 0.0)
+    return fail(401, message)
+
+
+@app.post('/api/passkey/register/options')
+def api_passkey_register_options() -> Response:
+    """Issue a WebAuthn registration challenge.
+
+    Allowed when the caller is already logged in as owner (e.g. via the debug password or an existing passkey)
+    OR during initial setup when no passkey has been registered yet and no debug password is required.
+    """
+    if has_passkey() or Handler.auth.debug_password_enabled:
+        auth_error = require_owner()
+        if auth_error:
+            return auth_error
+    rp_id = (request.host or 'localhost').split(':', 1)[0].strip().lower()
+    return jsonify({
+        'challenge': issue_webauthn_challenge('register'),
+        'rp': {'name': 'Gloan Photography', 'id': rp_id},
+        'user': {'id': 'gloan-owner', 'name': 'owner', 'displayName': 'Gloan Owner'},
+    })
+
+
+@app.post('/api/passkey/register')
+def api_passkey_register() -> Response:
+    """Verify and store the owner's newly created WebAuthn Passkey credential."""
+    if has_passkey() or Handler.auth.debug_password_enabled:
+        auth_error = require_owner()
+        if auth_error:
+            return auth_error
+    raw_body, body_error = read_body(16384)
+    if body_error or raw_body is None:
+        return body_error or fail(400, 'bad json')
+    try:
+        payload = json.loads(raw_body)
+        if not isinstance(payload, dict):
+            raise ValueError('expected JSON object')
+        register_passkey_credential(payload, request.host or 'localhost')
+    except (ValueError, TypeError) as error:
+        return fail(400, str(error))
+    return jsonify({'ok': True, 'token': Handler.auth.issue()})
+
+
+@app.post('/api/passkey/login/options')
+def api_passkey_login_options() -> Response:
+    """Issue a WebAuthn login challenge and return the registered credentialId."""
+    requester_ip = client_ip()
+    lockout_error = _check_rate_limit(requester_ip)
+    if lockout_error:
+        return lockout_error
+    stored = load_passkey()
+    if not stored:
+        return fail(404, 'no passkey registered yet')
+    rp_id = (request.host or 'localhost').split(':', 1)[0].strip().lower()
+    return jsonify({
+        'challenge': issue_webauthn_challenge('login'),
+        'rpId': rp_id,
+        'allowCredentials': [{'id': stored['credentialId'], 'type': 'public-key'}],
+    })
+
+
+@app.post('/api/passkey/login')
+def api_passkey_login() -> Response:
+    """Verify a WebAuthn Passkey login assertion + Cloudflare Turnstile CAPTCHA and return an owner token."""
+    requester_ip = client_ip()
+    lockout_error = _check_rate_limit(requester_ip)
+    if lockout_error:
+        return lockout_error
+    raw_body, body_error = read_body(16384)
+    if body_error or raw_body is None:
+        return body_error or fail(400, 'bad json')
+    try:
+        payload = json.loads(raw_body)
+        if not isinstance(payload, dict):
+            raise ValueError('expected JSON object')
+    except ValueError:
+        return fail(400, 'bad json')
+    if not verify_turnstile(str(payload.get('captchaToken', '')), requester_ip):
+        return _record_login_failure(requester_ip, 'captcha verification failed')
+    try:
+        verify_passkey_assertion(payload, request.host or 'localhost')
+    except (ValueError, TypeError) as error:
+        return _record_login_failure(requester_ip, str(error))
+    FAILS.pop(requester_ip, None)
+    return jsonify({'token': Handler.auth.issue()})
+
+
+# ============================================================================
+# DEBUG PASSWORD WORKAROUND ROUTE (REMOVE AFTER CLOUD PASSKEY VERIFICATION)
+# Exchanges the debug password (+ Turnstile token if enabled) for a session
+# token so you can log in during local Docker debug or first cloud setup to
+# register your Passkey. Returns 404 when debug_password_enabled is False.
+# ============================================================================
+@app.post('/api/login')
+def api_login() -> Response:
+    """Exchange the debug owner password for a signed token (only active when GLOAN_PASSWORD is set)."""
+    if not Handler.auth.debug_password_enabled:
+        return fail(404, 'password login disabled; use passkey')
+    requester_ip = client_ip()
+    lockout_error = _check_rate_limit(requester_ip)
+    if lockout_error:
+        return lockout_error
     raw_body, body_error = read_body(4096)
     if body_error:
         return body_error
     try:
         payload = json.loads(raw_body or b'')
         given_password = str(payload.get('password', ''))
+        captcha_token = str(payload.get('captchaToken', ''))
     except (ValueError, AttributeError):
         return fail(400, 'bad json')
+    if not verify_turnstile(captcha_token, requester_ip):
+        return _record_login_failure(requester_ip, 'captcha verification failed')
     if Handler.auth.check_password(given_password):
         FAILS.pop(requester_ip, None)
         return jsonify({'token': Handler.auth.issue()})
-    count += 1
-    FAILS[requester_ip] = (count, time.time() + LOCK_SECONDS if count >= MAX_FAILS else 0.0)
-    return fail(401, 'wrong password')
+    return _record_login_failure(requester_ip, 'wrong password')
 
 
 @app.post('/api/photos')

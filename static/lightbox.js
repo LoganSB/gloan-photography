@@ -3,7 +3,7 @@
  */
 
 import { API, createElement, escapeHtml, isOwner, parseTags, select, toast, withBusy } from './api.js';
-import { refresh, state, suggestionChips } from './gallery.js';
+import { pauseGalleryImageLoads, refresh, resumeGalleryImageLoads, state, suggestionChips } from './gallery.js';
 
 const SLIDE_INTERVAL_MS = 4500;
 
@@ -30,10 +30,18 @@ export function isSlideshowPlaying() {
 
 /**
  * Open the lightbox focused on the photo at `index` in the current page view.
+ * Immediately pauses any in-flight gallery tile downloads and schedules image loading after the browser paints
+ * the open modal + spinner so the popup appears on screen at 0ms.
  */
 export function openLightbox(index) {
+  pauseGalleryImageLoads();
   currentIndex = index;
   const lightboxEl = select('#lb');
+  const stageBox = select('#sbox');
+  const stageImage = select('#lbImg');
+  stageBox.classList.remove('zoom');
+  stageBox.classList.add('loading');
+  stageImage.removeAttribute('src');
   lightboxEl.classList.add('open');
   document.body.style.overflow = 'hidden';
   buildStrip();
@@ -41,20 +49,23 @@ export function openLightbox(index) {
 }
 
 /**
- * Close the lightbox, stop any running slideshow and exit fullscreen if active.
+ * Close the lightbox, stop any running slideshow, resume any unfinished gallery tile loads and exit fullscreen.
  */
 export function closeLightbox() {
   stopSlideshow();
+  slideLoadRunId++;
   select('#lb').classList.remove('open', 'show-edit', 'chromeless');
-  select('#sbox').classList.remove('zoom');
+  select('#sbox').classList.remove('zoom', 'loading');
+  select('#lbImg').removeAttribute('src');
   document.body.style.overflow = '';
   if (document.fullscreenElement) document.exitFullscreen();
+  resumeGalleryImageLoads();
 }
 
 /**
  * Render the current photo (`state.view[currentIndex]`) inside the lightbox stage, caption and story panel.
- * Displays the thumbnail immediately (if available) plus a spinning "Loading image…" indicator until the
- * full-resolution image finishes loading, with zero artificial timer delay on navigation.
+ * Updates the UI chrome and shows the spinning "Loading image…" indicator immediately, then defers starting
+ * the full-resolution image network request until after the next paint frame so opening the popup never blocks.
  */
 export function showSlide(instant = false) {
   const photo = state.view[currentIndex];
@@ -68,7 +79,9 @@ export function showSlide(instant = false) {
   const stageImage = select('#lbImg');
 
   // Update metadata, controls, story drawer and active strip thumbnail immediately on click.
+  stageBox.classList.add('loading');
   stageImage.classList.remove('out');
+  stageImage.removeAttribute('src');
   select('#lbTitle').textContent = photo.title || 'Untitled';
   select('#lbCnt').textContent = `${currentIndex + 1} / ${state.view.length}`;
   select('#lbTags').innerHTML = photo.tags
@@ -97,25 +110,27 @@ export function showSlide(instant = false) {
     }
   });
 
-  // Show the low-res tile right away as a preview while the full-resolution image loads in the background.
-  stageBox.classList.add('loading');
-  if (photo.thumbUrl && stageImage.getAttribute('src') !== photo.url) {
-    stageImage.src = photo.thumbUrl;
-  }
-
-  const fullLoader = new Image();
-  fullLoader.onload = fullLoader.onerror = () => {
-    if (runId !== slideLoadRunId) return; // user navigated to another slide before this one finished
-    stageImage.src = photo.url;
-    stageBox.classList.remove('loading');
+  // Start the full-resolution download on the next frame so the open modal and "Loading image…" spinner paint first.
+  const startFullDownload = () => {
+    if (runId !== slideLoadRunId) return;
+    const fullLoader = new Image();
+    fullLoader.onload = fullLoader.onerror = () => {
+      if (runId !== slideLoadRunId) return; // user navigated to another slide before this one finished
+      stageImage.src = photo.url;
+      stageBox.classList.remove('loading');
+      // Only preload neighbours AFTER the current full-size image has finished loading so we never compete for sockets.
+      [1, -1].forEach(delta => {
+        const neighbour = state.view[(currentIndex + delta + state.view.length) % state.view.length];
+        if (neighbour) new Image().src = neighbour.url;
+      });
+    };
+    fullLoader.src = photo.url;
   };
-  fullLoader.src = photo.url;
-
-  // Preload immediate neighbours so next/previous navigation feels instant.
-  [1, -1].forEach(delta => {
-    const neighbour = state.view[(currentIndex + delta + state.view.length) % state.view.length];
-    if (neighbour) new Image().src = neighbour.url;
-  });
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(startFullDownload);
+  } else {
+    setTimeout(startFullDownload, 0);
+  }
 
   if (isPlaying) restartProgressBar();
 }
@@ -132,13 +147,19 @@ export function goSlide(delta) {
 
 /**
  * Rebuild the bottom thumbnail strip for the photos on the current page.
+ * Only assigns `src` when a lightweight `thumbUrl` tile exists so opening the lightbox never triggers
+ * 10 concurrent multi-megabyte full-image downloads that saturate browser sockets.
  */
 export function buildStrip() {
   const stripEl = select('#strip');
   stripEl.innerHTML = '';
   state.view.forEach((photo, index) => {
     const thumbImg = createElement('img');
-    thumbImg.src = photo.thumbUrl || photo.url;
+    if (photo.thumbUrl) {
+      thumbImg.src = photo.thumbUrl;
+    } else {
+      thumbImg.alt = photo.title || 'Untitled';
+    }
     thumbImg.onclick = () => {
       currentIndex = index;
       showSlide();

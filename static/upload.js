@@ -54,7 +54,7 @@ export function renderStaged() {
   stagedBox.innerHTML = '';
   stagedFiles.forEach(item => {
     const row = createElement('div', 'stage');
-    row.innerHTML = `<img src="${item.preview}"><div class="f"><input class="field" value="${escapeHtml(item.title)}" placeholder="Title"><input class="field" value="${escapeHtml(item.tags)}" placeholder="Tags for this photo (optional)"></div>`;
+    row.innerHTML = `<img src="${item.preview}"><div class="f"><input class="field" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" value="${escapeHtml(item.title)}" placeholder="Title"><input class="field" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" value="${escapeHtml(item.tags)}" placeholder="Tags for this photo (optional)"></div>`;
     const [titleInput, tagsInput] = row.querySelectorAll('input');
     titleInput.oninput = () => { item.title = titleInput.value; };
     tagsInput.oninput = () => { item.tags = tagsInput.value; };

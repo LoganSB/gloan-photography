@@ -4,7 +4,7 @@ from typing import Any
 
 from gloan.config import DEFAULT_PAGE_SIZE, MAX_FILTER_TAGS, MAX_PAGE_SIZE
 from gloan.storage import available_rows, file_size, public_row
-from gloan.tags import get_tag_index
+from gloan.tags import get_tag_index, row_matches_all_tag_terms
 
 
 # sort name -> (key function, newest/largest/Z-first?). Names must match SORTS in index.html.
@@ -41,15 +41,20 @@ def query_photos(params: dict[str, list[str]]) -> dict[str, Any]:
     rows = available_rows()
     first_value = lambda name: (params.get(name) or [None])[0]  # noqa: E731
     size = parse_int(first_value('size'), DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE)
-    wanted = [tag for tag in (first_value('tags') or '').split(',') if tag][:MAX_FILTER_TAGS]
-    require_all = first_value('match') == 'all'
+    wanted = [tag.strip() for tag in (first_value('tags') or '').split(',') if tag.strip()][:MAX_FILTER_TAGS]
+    query_terms = [term.strip() for term in (first_value('q') or '').split(',') if term.strip()][:MAX_FILTER_TAGS]
+    require_any = first_value('match') == 'any'
     sort_key, descending = SORT_KEYS.get(first_value('sort') or '', SORT_KEYS['new'])
 
+    matching = rows
     if wanted:
-        combine = all if require_all else any
-        matching = [row for row in rows if combine(tag in row['tags'] for tag in wanted)]
-    else:
-        matching = rows
+        # Selected tag chips default to AND matching ('all') so selecting multiple chips requires all of them.
+        combine = any if require_any else all
+        matching = [row for row in matching if combine(tag in row['tags'] for tag in wanted)]
+    if query_terms:
+        # Comma-separated search terms (e.g. "*winter, bryce") ALWAYS require every term to match (AND matching),
+        # supporting wildcards (*, ?), prefixes, word boundaries and 1-character typos on each term.
+        matching = [row for row in matching if row_matches_all_tag_terms(row, query_terms)]
     matching = sorted(matching, key=sort_key, reverse=descending)
 
     pages = max(1, -(-len(matching) // size))  # ceiling division
