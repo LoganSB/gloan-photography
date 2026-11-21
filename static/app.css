@@ -88,6 +88,7 @@ header.top{position:sticky;top:0;z-index:20;backdrop-filter:blur(16px);backgroun
 .ov h3{font-size:15px;font-weight:600;transform:translateY(8px);transition:transform .35s}
 .ov .t{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;transform:translateY(8px);transition:transform .35s .04s}
 .ov .t span{font-size:11px;padding:2px 9px;border-radius:99px;background:rgba(255,255,255,.18);backdrop-filter:blur(6px)}
+.ov .t span.ai-tag,.cap .t span.ai-tag{border:1px dashed rgba(255,255,255,.32);background:rgba(255,255,255,.09)}
 .card:hover .ov h3,.card:hover .ov .t{transform:none}
 .ov .addtag{position:absolute;top:10px;right:10px;padding:5px 12px;font-size:12px;background:rgba(0,0,0,.55);color:#fff;border-color:rgba(255,255,255,.25)}
 .card:not(.loaded){min-height:180px} /* placeholder until its image has been fetched */

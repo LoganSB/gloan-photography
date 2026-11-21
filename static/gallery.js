@@ -313,7 +313,13 @@ export function render() {
   state.view.forEach((photo, index) => {
     const card = createElement('div', 'card in');
     const storyBadge = photo.story ? '<div class="sb">Read the story</div>' : '';
-    const tagPills = photo.tags.map(tag => `<span>${escapeHtml(tag)}</span>`).join('');
+    const manualTags = photo.tags || [];
+    const manualSet = new Set(manualTags);
+    const aiTags = (photo.aiTags || []).filter(tag => !manualSet.has(tag));
+    const tagPills = [
+      ...manualTags.map(tag => `<span>${escapeHtml(tag)}</span>`),
+      ...aiTags.map(tag => `<span class="ai-tag" title="AI tag">${escapeHtml(tag)}</span>`),
+    ].join('');
     card.innerHTML = `<div class="card-loader"><span class="spinner" aria-hidden="true"></span><span>Loading image…</span></div><img data-src="${photo.thumbUrl || photo.url}" alt="${escapeHtml(photo.title || '')}"><div class="ov"><button class="btn owner-only addtag">+ tags</button><h3>${escapeHtml(photo.title || 'Untitled')}</h3>${storyBadge}<div class="t">${tagPills}</div></div>`;
     card.querySelector('.addtag').onclick = event => {
       event.stopPropagation(); // don't also open the lightbox when clicking "+ tags"

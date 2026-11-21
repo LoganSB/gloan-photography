@@ -13,7 +13,7 @@ import unicodedata
 from typing import Any
 
 from gloan.config import INDEX_FILE, MAX_TAG_QUERY, PHOTO_DIR
-from gloan.storage import Row, available_rows, index_generation
+from gloan.storage import Row, all_row_tags, available_rows, index_generation
 
 FUZZY_MIN_LENGTH = 3  # shorter queries: one typo would match almost everything, so only exact/prefix/contains apply
 MAX_WILDCARD_STARS = 2  # more '*' could make the regex backtrack heavily; extra ones are dropped
@@ -149,7 +149,7 @@ class TagIndex:
     def __init__(self, rows: list[Row]) -> None:
         counts: dict[str, int] = {}
         for row in rows:
-            for tag in row.get('tags', []):
+            for tag in all_row_tags(row):
                 counts[tag] = counts.get(tag, 0) + 1
         self.counts = counts
         # Most-used first, then alphabetical: the order of the filter chips and of empty-query suggestions.
@@ -196,11 +196,11 @@ class TagIndex:
 
 
 def row_matches_tag_term(row: Row, term_query: str) -> bool:
-    """True when `row` has at least one tag that matches `term_query` (using exact, prefix, wildcard or fuzzy rules)."""
+    """True when `row` has at least one manual or AI tag matching `term_query` (exact, prefix, wildcard or fuzzy)."""
     key = search_key(term_query[:MAX_TAG_QUERY])
     if not key:
         return True
-    for tag in row.get('tags', []):
+    for tag in all_row_tags(row):
         if classify_match(search_key(tag), key) is not None:
             return True
     return False

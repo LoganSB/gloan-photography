@@ -242,13 +242,25 @@ def thumb_path(row: Row) -> Path | None:
     return None
 
 
+def all_row_tags(row: Row) -> list[str]:
+    """Return the combined manual/uploaded `tags` and AI-generated `aiTags` for a photo (manual tags first)."""
+    combined: list[str] = []
+    for tag in [*(row.get('tags') or []), *(row.get('aiTags') or [])]:
+        if isinstance(tag, str) and tag and tag not in combined:
+            combined.append(tag)
+    return combined
+
+
 def public_row(row: Row) -> Row:
-    """Row as the API exposes it, with image URL, tile URL (None until generated), AI tags list and file size (bytes)."""
+    """Row as the API exposes it, keeping manual `tags` and AI `aiTags` tracked separately."""
     thumb = thumb_path(row)
+    manual_tags = clean_tags(row.get('tags') or [])
+    ai_tags = clean_tags(row.get('aiTags') or [])
     return {
         'story': '',
-        'aiTags': [],
         **row,
+        'tags': manual_tags,
+        'aiTags': ai_tags,
         'url': f'/photos/{row["id"]}.{row["ext"]}',
         'thumbUrl': f'/thumbs/{thumb.name}' if thumb else None,
         'size': file_size(row),

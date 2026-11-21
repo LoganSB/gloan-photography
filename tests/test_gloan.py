@@ -550,21 +550,26 @@ class ServerAndApiTest(unittest.TestCase):
             {'Authorization': f'Bearer {token}', 'Content-Type': 'image/jpeg', 'X-Title': 'T',
              'X-Tags': 'landscape,lake'})
         self.assertEqual(status, 201)
+        self.assertEqual(row.get('tags'), ['landscape', 'lake'])
         self.assertGreaterEqual(len(row.get('aiTags', [])), 5)
         status, reply = self.api_call('/api/tags?q=landscpe')
         self.assertEqual(status, 200)
         self.assertEqual(reply['suggestions'][0], {'tag': 'landscape', 'count': 1, 'match': 'fuzzy'})
         _, reply = self.api_call('/api/tags?q=&limit=999')
-        self.assertGreaterEqual(len(reply['suggestions']), 5)
+        self.assertGreaterEqual(len(reply['suggestions']), 7)
         self.assertLessEqual(len(reply['suggestions']), 20)
 
-        # Editing tags must invalidate the cached index right away.
+        # Editing manual tags must update `tags`, keep `aiTags` separate, and invalidate the cached TagIndex right away.
         self.api_call(f'/api/photos/{row["id"]}', 'PATCH', json.dumps({'title': 'T', 'tags': ['river']}).encode(),
                       {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'})
         _, reply = self.api_call('/api/tags?q=rivr')
         self.assertEqual(reply['suggestions'][0]['tag'], 'river')
         _, listing = self.api_call('/api/photos')
-        self.assertEqual(listing['tags'], [['river', 1]])
+        self.assertEqual(listing['photos'][0]['tags'], ['river'])
+        self.assertGreaterEqual(len(listing['photos'][0]['aiTags']), 5)
+        listed_tag_names = {tag_name for tag_name, _ in listing['tags']}
+        self.assertIn('river', listed_tag_names)
+        self.assertNotIn('lake', listed_tag_names)
 
     def test_multi_tag_and_filtering_with_random_dataset(self) -> None:
         """Generate a randomized synthetic photo dataset and verify AND chip filtering, comma-delimited search, and per-comma autocomplete."""
@@ -634,7 +639,7 @@ class ServerAndApiTest(unittest.TestCase):
         self.assertEqual(self.api_call('/api/thumbnails', 'GET')[0], 401)
         self.assertEqual(self.api_call('/api/thumbnails', 'POST', b'')[0], 401)
 
-        # Authenticated rescan adopts a hand-copied file and AI-tags it with at least 5 tags.
+        # Authenticated rescan adopts a hand-copied file and AI-tags it with at least 5 tags tracked separately in aiTags.
         (PHOTO_DIR / 'Copied_Photo.jpg').write_bytes(TINY_JPEG)
         token = self.login_token()
         status, scan_reply = self.api_call('/api/rescan', 'POST', b'', {'Authorization': f'Bearer {token}'})
@@ -643,24 +648,24 @@ class ServerAndApiTest(unittest.TestCase):
         self.assertEqual(scan_reply['aiTagged'], 1)
         saved_rows = load_index()
         self.assertEqual(len(saved_rows), 1)
+        self.assertEqual(saved_rows[0].get('tags'), [])
         self.assertGreaterEqual(len(saved_rows[0].get('aiTags', [])), 5)
-        for ai_tag in saved_rows[0]['aiTags']:
-            self.assertIn(ai_tag, saved_rows[0]['tags'])
 
-        # A second rescan skips photos that already have aiTags recorded in photos.json (0 redundant work/cost).
+        # A second rescan skips photos that already have >= 5 aiTags recorded in photos.json (0 redundant work/cost).
         status2, scan_reply2 = self.api_call('/api/rescan', 'POST', b'', {'Authorization': f'Bearer {token}'})
         self.assertEqual(status2, 200)
         self.assertEqual(scan_reply2['added'], 0)
         self.assertEqual(scan_reply2['aiTagged'], 0)
 
-        # Existing photos in photos.json without aiTags get tagged on manual admin rescan.
+        # Existing photos in photos.json with < 5 aiTags trigger AI tagging on manual admin rescan while preserving manual tags.
         (PHOTO_DIR / 'p2222222222222222.jpg').write_bytes(TINY_JPEG)
         rows = load_index()
         rows.append({
             'id': 'p2222222222222222',
             'ext': 'jpg',
-            'title': 'Sunset Canyon Trail',
-            'tags': ['utah'],
+            'title': 'Bryce Sunset Canyon Trail',
+            'tags': ['utah', 'manual-tag'],
+            'aiTags': ['partial-ai-tag'],
             'story': '',
             'added': 1700000000000,
         })
@@ -669,9 +674,17 @@ class ServerAndApiTest(unittest.TestCase):
         self.assertEqual(status3, 200)
         self.assertEqual(scan_reply3['aiTagged'], 1)
         untagged_now = next(item for item in load_index() if item['id'] == 'p2222222222222222')
+        # Manual tags are tracked separately and never overwritten or polluted by aiTags.
+        self.assertEqual(untagged_now['tags'], ['utah', 'manual-tag'])
         self.assertGreaterEqual(len(untagged_now.get('aiTags', [])), 5)
-        self.assertIn('utah', untagged_now['tags'])
-        self.assertIn('sunset', untagged_now['tags'])
+        self.assertIn('partial-ai-tag', untagged_now['aiTags'])
+        self.assertIn('bryce-canyon', untagged_now['aiTags'])
+        self.assertIn('colorado-plateau', untagged_now['aiTags'])
+        # Both manual tags and aiTags are searchable via /api/photos?q= and /api/photos?tags=.
+        _, by_manual = self.api_call('/api/photos?tags=manual-tag')
+        self.assertEqual([p['id'] for p in by_manual['photos']], ['p2222222222222222'])
+        _, by_ai = self.api_call('/api/photos?tags=bryce-canyon')
+        self.assertEqual([p['id'] for p in by_ai['photos']], ['p2222222222222222'])
 
     def test_passkey_webauthn_multi_device_and_turnstile(self) -> None:
         """Verify multi-device WebAuthn Passkey enrollment (phone + desktop + laptop), assertion login, and Turnstile CAPTCHA."""

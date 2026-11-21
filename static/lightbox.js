@@ -84,9 +84,13 @@ export function showSlide(instant = false) {
   stageImage.removeAttribute('src');
   select('#lbTitle').textContent = photo.title || 'Untitled';
   select('#lbCnt').textContent = `${currentIndex + 1} / ${state.view.length}`;
-  select('#lbTags').innerHTML = photo.tags
-    .map(tag => `<span data-t="${escapeHtml(tag)}">${escapeHtml(tag)}</span>`)
-    .join('');
+  const manualTags = photo.tags || [];
+  const manualSet = new Set(manualTags);
+  const aiTags = (photo.aiTags || []).filter(tag => !manualSet.has(tag));
+  select('#lbTags').innerHTML = [
+    ...manualTags.map(tag => `<span data-t="${escapeHtml(tag)}">${escapeHtml(tag)}</span>`),
+    ...aiTags.map(tag => `<span class="ai-tag" data-t="${escapeHtml(tag)}" title="AI tag">${escapeHtml(tag)}</span>`),
+  ].join('');
   select('#lbTags').querySelectorAll('span').forEach(span => {
     span.onclick = () => {
       closeLightbox();

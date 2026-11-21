@@ -3,7 +3,7 @@
 from typing import Any
 
 from gloan.config import DEFAULT_PAGE_SIZE, MAX_FILTER_TAGS, MAX_PAGE_SIZE
-from gloan.storage import available_rows, file_size, public_row
+from gloan.storage import all_row_tags, available_rows, file_size, public_row
 from gloan.tags import get_tag_index, row_matches_all_tag_terms
 
 
@@ -48,9 +48,9 @@ def query_photos(params: dict[str, list[str]]) -> dict[str, Any]:
 
     matching = rows
     if wanted:
-        # Selected tag chips default to AND matching ('all') so selecting multiple chips requires all of them.
+        # Selected tag chips default to AND matching ('all') across both manual `tags` and `aiTags`.
         combine = any if require_any else all
-        matching = [row for row in matching if combine(tag in row['tags'] for tag in wanted)]
+        matching = [row for row in matching if combine(tag in all_row_tags(row) for tag in wanted)]
     if query_terms:
         # Comma-separated search terms (e.g. "*winter, bryce") ALWAYS require every term to match (AND matching),
         # supporting wildcards (*, ?), prefixes, word boundaries and 1-character typos on each term.
