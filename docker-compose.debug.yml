@@ -16,5 +16,4 @@ services:
       - ./index.html:/app/index.html
       - ./data:/data
     environment:
-      - GLOAN_PASSWORD=debugpassword
       - PYTHONUNBUFFERED=1

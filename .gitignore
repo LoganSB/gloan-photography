@@ -4,3 +4,6 @@ __pycache__/
 .DS_Store
 /data/photos/*
 /data/thumbs/*
+/data/passkey.json
+/data/session.key
+PENTEST_RESULTS.md

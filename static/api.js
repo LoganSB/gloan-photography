@@ -154,13 +154,6 @@ export const API = {
     return this.call('GET', '/api/tags?' + new URLSearchParams({ q: query, limit }));
   },
 
-  login(password, captchaToken = '') {
-    return this.call('POST', '/api/login', {
-      body: JSON.stringify({ password, captchaToken }),
-      headers: { 'Content-Type': 'application/json' },
-    });
-  },
-
   passkeyRegisterOptions() {
     return this.call('POST', '/api/passkey/register/options');
   },

@@ -2,5 +2,10 @@ data/
 __pycache__/
 .ruff_cache/
 .git/
+.vscode/
 .env
 *.md
+tests/
+Dockerfile.debug
+docker-compose.debug.yml
+deploy.sh

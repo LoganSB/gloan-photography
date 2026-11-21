@@ -10,6 +10,13 @@
 
 <header class="top"><div class="wrap bar">
   <div class="brand">Gloan <span>/ photography</span></div>
+  <!-- Static (not rebuilt by render()) so typing is never interrupted when the gallery refreshes. -->
+  <div class="search">
+    <input class="field" id="tagSearch" type="search" placeholder="Search tags… (e.g. *wint or *winter, bryce)" autocomplete="off"
+      data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other"
+      role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="tagSuggest">
+    <ul class="suggest" id="tagSuggest" role="listbox"></ul>
+  </div>
   <div class="spacer"></div>
   <button class="btn" id="slideBtn" title="Play slideshow">▶ <span class="lbl">Slideshow</span></button>
   <button class="btn" id="authBtn" title="Admin login"><span class="lbl">Admin login</span></button>
@@ -18,18 +25,11 @@
 </div></header>
 
 <main class="wrap">
-  <!-- Static (not rebuilt by render()) so typing is never interrupted when the gallery refreshes. -->
-  <div class="search">
-    <input class="field" id="tagSearch" type="search" placeholder="Search tags… (e.g. *wint or *winter, bryce)" autocomplete="off"
-      data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other"
-      role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="tagSuggest">
-    <ul class="suggest" id="tagSuggest" role="listbox"></ul>
-  </div>
   <div class="filters" id="filters"></div>
   <div id="galleryHost"></div>
 </main>
 
-<footer><div class="wrap">© Gloan <span class="owner-only" id="scanWrap"> · <a id="scanBtn">Scan folder for new photos</a> · <a id="thumbBtn">Generate thumbnails</a> · <a id="passkeyRegBtn">Register Passkey</a></span></div></footer>
+<footer><div class="wrap"><div>© Gloan</div><div class="owner-only footer-links" id="scanWrap"><a id="scanBtn">Scan folder for new photos</a><a id="thumbBtn">Generate thumbnails</a><a id="passkeyRegBtn">Register Passkey</a></div></div></footer>
 
 <!-- upload modal -->
 <div class="modal" id="upModal"><div class="panel">
@@ -48,21 +48,13 @@
 </div></div>
 <input type="file" id="file" accept="image/*" multiple hidden>
 
-<!-- Admin login (Passkey + Cloudflare Turnstile CAPTCHA; debug password row hidden unless debugPasswordEnabled) -->
+<!-- Admin login (WebAuthn Passkey + Cloudflare Turnstile CAPTCHA) -->
 <div class="modal" id="loginModal"><div class="panel" style="width:min(400px,100%)">
   <header><h2>Admin login</h2><button class="btn icon" id="loginClose">✕</button></header>
   <div class="body">
     <div id="turnstileBox" style="display:none;justify-content:center;min-height:65px"></div>
     <button class="btn primary" id="passkeyLoginBtn" style="width:100%;justify-content:center">Sign in with Passkey</button>
-    <button class="btn" id="passkeySetupBtn" style="display:none;width:100%;justify-content:center">Register owner Passkey</button>
-    <!-- DEBUG PASSWORD WORKAROUND (remove #debugPwSection once cloud passkey is verified) -->
-    <div id="debugPwSection" style="display:none;flex-direction:column;gap:8px;padding-top:8px;border-top:1px solid var(--line)">
-      <div class="hint">Debug password workaround (active while GLOAN_PASSWORD is set):</div>
-      <div style="display:flex;gap:8px">
-        <input class="field" id="pw" type="password" placeholder="Debug password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other">
-        <button class="btn" id="loginGo">Log in</button>
-      </div>
-    </div>
+    <button class="btn primary" id="passkeySetupBtn" style="display:none;width:100%;justify-content:center">Register owner Passkey</button>
     <div class="hint" id="loginErr"></div>
   </div>
 </div></div>

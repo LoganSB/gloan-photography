@@ -37,8 +37,6 @@ let hasRegisteredPasskey = false;
 let turnstileSiteKey = '';
 let turnstileToken = '';
 let turnstileWidgetId = null;
-// DEBUG WORKAROUND FLAG (remove once cloud passkey is verified)
-let debugPasswordEnabled = false;
 
 /**
  * Convert a base64url string from the server into a Uint8Array for WebAuthn browser APIs.
@@ -97,29 +95,20 @@ function ensureTurnstileWidget() {
 }
 
 /**
- * Open the Admin login modal, configuring Passkey buttons, Cloudflare Turnstile and optional debug password input.
+ * Open the Admin login modal, showing Sign in with Passkey (or first-time Register Passkey) and Cloudflare Turnstile.
  */
 function openLogin() {
   select('#loginErr').textContent = '';
-  select('#pw').value = '';
   select('#passkeyLoginBtn').style.display = hasRegisteredPasskey ? 'inline-flex' : 'none';
-  // Allow first-time passkey enrollment directly from the modal when no passkey exists and no debug password is set.
-  select('#passkeySetupBtn').style.display = (!hasRegisteredPasskey && !debugPasswordEnabled) ? 'inline-flex' : 'none';
-  // DEBUG PASSWORD WORKAROUND: only shown while GLOAN_PASSWORD is set on the server.
-  select('#debugPwSection').style.display = debugPasswordEnabled ? 'flex' : 'none';
+  select('#passkeySetupBtn').style.display = hasRegisteredPasskey ? 'none' : 'inline-flex';
   ensureTurnstileWidget();
   select('#loginModal').classList.add('open');
-  if (debugPasswordEnabled && !hasRegisteredPasskey) {
-    setTimeout(() => select('#pw').focus(), 30);
-  }
 }
 
 /**
- * Close the Admin login modal and clear `#pw` so Chromium/Brave password managers never mistake subsequent
- * form submissions (like Add Tags) for a login submission.
+ * Close the Admin login modal.
  */
 function closeLogin() {
-  select('#pw').value = '';
   select('#loginModal').classList.remove('open');
 }
 
@@ -134,6 +123,10 @@ async function registerPasskey(triggerButton) {
         throw new Error('Passkeys (WebAuthn) are not supported in this browser');
       }
       const options = await API.passkeyRegisterOptions();
+      const excludeCredentials = (options.excludeCredentials || []).map(item => ({
+        id: base64UrlToBytes(item.id),
+        type: item.type,
+      }));
       const credential = await navigator.credentials.create({
         publicKey: {
           challenge: base64UrlToBytes(options.challenge),
@@ -144,6 +137,7 @@ async function registerPasskey(triggerButton) {
             displayName: options.user.displayName,
           },
           pubKeyCredParams: [{ alg: -7, type: 'public-key' }], // ES256 (ECDSA P-256)
+          excludeCredentials,
           authenticatorSelection: { userVerification: 'preferred' },
           timeout: 60000,
         },
@@ -164,7 +158,7 @@ async function registerPasskey(triggerButton) {
         setOwner(true);
       }
       closeLogin();
-      toast('Owner Passkey registered');
+      toast(`Owner Passkey registered (${reply.passkeyCount || 1} device${(reply.passkeyCount || 1) > 1 ? 's' : ''} enrolled)`);
     } catch (error) {
       select('#loginErr').textContent = error.message;
       toast(error.message);
@@ -218,32 +212,6 @@ async function doPasskeyLogin() {
   });
 }
 
-// ============================================================================
-// DEBUG PASSWORD WORKAROUND (REMOVE AFTER CLOUD PASSKEY VERIFICATION)
-// ============================================================================
-async function doDebugPasswordLogin() {
-  select('#loginErr').textContent = '';
-  if (turnstileSiteKey && !turnstileToken) {
-    select('#loginErr').textContent = 'Please complete the CAPTCHA verification first.';
-    return;
-  }
-  await withBusy(select('#loginGo'), 'Logging in…', async () => {
-    try {
-      const reply = await API.login(select('#pw').value, turnstileToken);
-      API.setToken(reply.token);
-      closeLogin();
-      setOwner(true);
-      toast(hasRegisteredPasskey ? 'Logged in (debug password)' : 'Logged in — click "Register Passkey" in the footer');
-    } catch (error) {
-      select('#loginErr').textContent = error.message;
-      if (window.turnstile && turnstileWidgetId !== null) {
-        turnstileToken = '';
-        window.turnstile.reset(turnstileWidgetId);
-      }
-    }
-  });
-}
-
 /**
  * Bootstrap the gallery: check session status, fetch the initial page and render.
  * Shows an immediate loading indicator in `#galleryHost` while the initial API calls are in flight.
@@ -256,7 +224,6 @@ async function load() {
     state.ready = true;
     hasRegisteredPasskey = !!session.hasPasskey;
     turnstileSiteKey = session.turnstileSiteKey || '';
-    debugPasswordEnabled = !!session.debugPasswordEnabled;
     setOwner(session.owner, false);
   } catch (error) {
     host.innerHTML = '<div class="empty"><h2>Can’t reach the gallery server</h2><p>Start it with <code>python3 server.py</code> and open the address it prints.</p></div>';
@@ -285,12 +252,7 @@ select('#authBtn').onclick = () => {
 select('#passkeyLoginBtn').onclick = doPasskeyLogin;
 select('#passkeySetupBtn').onclick = () => registerPasskey(select('#passkeySetupBtn'));
 select('#passkeyRegBtn').onclick = () => registerPasskey(select('#passkeyRegBtn'));
-select('#loginGo').onclick = doDebugPasswordLogin;
 select('#loginClose').onclick = closeLogin;
-select('#pw').onkeydown = event => {
-  if (event.key === 'Enter') doDebugPasswordLogin();
-  else if (event.key === 'Escape') closeLogin();
-};
 select('#loginModal').addEventListener('mousedown', event => {
   if (event.target.id === 'loginModal') closeLogin();
 });

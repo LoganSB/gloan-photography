@@ -15,16 +15,6 @@ from gloan.handler import Handler, app
 from gloan.storage import scan_folder
 
 
-# ============================================================================
-# DEBUG PASSWORD WORKAROUND (REMOVE AFTER CLOUD PASSKEY VERIFICATION)
-# Reads GLOAN_PASSWORD from the environment if set. When unset or empty,
-# password authentication is completely disabled and only Passkey login works.
-# ============================================================================
-def get_debug_password() -> str:
-    """Optional debug password from GLOAN_PASSWORD; '' disables password login completely."""
-    return os.environ.get('GLOAN_PASSWORD', '').strip()
-
-
 def stop_on_sigterm(signum: int, frame: Any) -> None:
     """Raise KeyboardInterrupt so the server loop unwinds cleanly on SIGTERM (e.g. Cloud Run shutdown)."""
     raise KeyboardInterrupt
@@ -65,7 +55,10 @@ def _run_with_gunicorn(host: str, port: int) -> bool:
         'bind': f'{host}:{port}',
         'workers': 1,
         'threads': 8,
-        'timeout': 120,
+        'timeout': 30,
+        'keepalive': 2,
+        'max_requests': 1000,
+        'max_requests_jitter': 100,
         'accesslog': '-',
     }).run()
     return True
@@ -91,7 +84,7 @@ def main() -> None:
     Handler.proxy_header = args.proxy_header
     Handler.proxy_hops = max(1, args.proxy_hops)
     Handler.proxy_any_peer = args.proxy_any_peer
-    Handler.auth = Auth(get_debug_password())
+    Handler.auth = Auth()
     PHOTO_DIR.mkdir(parents=True, exist_ok=True)
     adopted = scan_folder()
     if adopted:

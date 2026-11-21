@@ -1,8 +1,7 @@
 FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    GLOAN_DATA=/data \
-    GLOAN_PASSWORD=debugpassword
+    GLOAN_DATA=/data
 
 WORKDIR /app
 

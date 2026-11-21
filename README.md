@@ -28,18 +28,18 @@ Env: `GLOAN_DATA` moves the storage folder (default `./data`).
 
 ## Who can log in
 
-Owner authentication uses **WebAuthn Passkeys (FIDO2)** (TouchID / FaceID / Windows Hello / YubiKey) protected by
-**Cloudflare Turnstile** bot CAPTCHA (when `GLOAN_TURNSTILE_SITE_KEY` and `GLOAN_TURNSTILE_SECRET_KEY` are set) and
-IP failure lockout (5 failures = 60s lockout). Your private key never leaves your device; only the ES256 public key
-and credential ID are stored in `data/passkey.json`.
+Owner authentication uses **WebAuthn Passkeys (FIDO2)** (TouchID / FaceID / Windows Hello / YubiKey / phone QR code)
+protected by **Cloudflare Turnstile** bot CAPTCHA (when `GLOAN_TURNSTILE_SITE_KEY` and `GLOAN_TURNSTILE_SECRET_KEY` are
+set) and IP failure lockout (5 failures = 60s lockout). There is no password route or password fallback. Your private
+keys never leave your devices; only the ES256 public keys and credential IDs are stored in `data/passkey.json`.
 
-**Initial Passkey enrollment & debug password workaround:**
-While `GLOAN_PASSWORD` is set in the environment (such as `debugpassword` in local Docker debugging, or on your first
-Cloud Run deployment), the login modal also shows a temporary debug password box. Log in once with that password,
-click **Register Passkey** in the footer, and complete your browser's Passkey prompt. Once `data/passkey.json` exists
-and you have verified signing in with your Passkey, unset `GLOAN_PASSWORD` (or remove the marked
-`DEBUG PASSWORD WORKAROUND` block in `gloan/auth.py`, `gloan/handler.py` and `static/app.js`) to disable password
-authentication completely.
+**Enrolling your first Passkey and adding additional devices (desktop, laptop, phone):**
+- When `data/passkey.json` does not exist yet (e.g. a brand-new local `http://localhost:8000` setup), click
+  **Admin login** → **Register owner Passkey** to enroll your first passkey.
+- Once at least one passkey is registered (such as the phone passkey you already registered on `gloan.me`), unauthenticated
+  registration is locked. To add your home computer, laptop, or a new device: sign in on that computer once using your
+  existing phone passkey (via the browser's QR/Bluetooth passkey prompt), then click **Register Passkey** in the footer
+  to enroll that computer's own local Windows Hello / TouchID / browser passkey alongside your phone passkey.
 
 ## Data
 
@@ -75,8 +75,7 @@ network in the clear.
 | GET | `/api/photos?page=0&size=10&sort=new&tags=a,b&match=any` (one page of photos, each with `added` ms timestamp and `size` bytes, plus `total`, `all`, `pages` and gallery-wide `tags` counts; `size` max 100; `sort` is `new`, `old`, `az`, `za`, `big` or `small`; `match` is `any` or `all`), `/photos/<id>.<ext>`, `/api/session` | public |
 | GET | `/api/tags?q=text&limit=8` (tag suggestions, best first: `[{tag, count, match}]` where `match` is `exact`, `prefix`, `word`, `contains`, `wildcard`, `fuzzy` or `popular`; `limit` max 20) | public |
 | POST | `/api/passkey/login/options`, `/api/passkey/login` (WebAuthn Passkey assertion + Turnstile `captchaToken`) -> `{"token"}` | public (5 failures = 60s lockout) |
-| POST | `/api/passkey/register/options`, `/api/passkey/register` (stores ES256 public key in `data/passkey.json`) | owner (or first-time setup) |
-| POST | `/api/login` `{"password","captchaToken"}` -> `{"token"}` *(debug workaround only; 404 when `GLOAN_PASSWORD` unset)* | public (5 failures = 60s lockout) |
+| POST | `/api/passkey/register/options`, `/api/passkey/register` (appends ES256 public key to `data/passkey.json`) | owner (or first-time setup when no passkey exists) |
 | GET | `/thumbs/<id>.jpg` | public |
 | GET | `/api/thumbnails` (job status: `running`, `exitCode`, `output`, `missing`) | owner |
 | POST | `/api/thumbnails` (starts `tools/make_thumbnails.py` in the background) | owner |

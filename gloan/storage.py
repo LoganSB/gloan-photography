@@ -39,20 +39,26 @@ def sniff_ext(data: bytes) -> str | None:
 
 
 def clean_title(raw: object) -> str:
-    """Collapse whitespace and cap the length of a user-supplied title."""
-    return re.sub(r'\s+', ' ', str(raw)).strip()[:200]
+    """Strip control characters, collapse whitespace and cap the length of a user-supplied title."""
+    without_controls = re.sub(r'[\x00-\x1f\x7f]', ' ', str(raw))
+    return re.sub(r'\s+', ' ', without_controls).strip()[:200]
 
 
 def clean_story(raw: object) -> str:
-    """Normalise line endings, limit blank-line runs and cap the length of a photo's story."""
-    return re.sub(r'\n{3,}', '\n\n', str(raw).replace('\r\n', '\n').strip())[:MAX_STORY]
+    """Strip non-newline control characters, normalise line endings, limit blank-line runs and cap story length."""
+    normalised = str(raw).replace('\r\n', '\n').replace('\r', '\n')
+    without_controls = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', normalised)
+    return re.sub(r'\n{3,}', '\n\n', without_controls.strip())[:MAX_STORY]
 
 
 def clean_tags(tags: list[Any]) -> list[str]:
     """Normalise tags the same way the front end does: lowercase, hyphenated, unique, bounded."""
+    if not isinstance(tags, (list, tuple)):
+        return []
     out: list[str] = []
     for tag in tags:
-        norm = re.sub(r'\s+', '-', str(tag).strip().lower())[:40]
+        without_controls = re.sub(r'[\x00-\x1f\x7f,]', ' ', str(tag))
+        norm = re.sub(r'\s+', '-', without_controls.strip().lower())[:40]
         if norm and norm not in out:
             out.append(norm)
     return out[:30]
@@ -182,8 +188,8 @@ def scan_folder(skipped: list[str] | None = None) -> int:
         for path in sorted(PHOTO_DIR.iterdir()):
             if path.name in known or path.name.startswith('.'):
                 continue
-            if not path.is_file():
-                skipped.append(f'{path.name} (folder: photos must sit directly in photos/)')
+            if path.is_symlink() or not path.is_file():
+                skipped.append(f'{path.name} (not a regular file)')
                 continue
             with path.open('rb') as file_handle:
                 ext = sniff_ext(file_handle.read(16))
@@ -230,7 +236,7 @@ def thumb_path(row: Row) -> Path | None:
     if not match or match.group(1) != row['id']:
         return None
     cache = get_rows_cache()
-    if name in cache.thumb_names or (THUMB_DIR / name).is_file():
+    if name in cache.thumb_names:
         return THUMB_DIR / name
     return None
 

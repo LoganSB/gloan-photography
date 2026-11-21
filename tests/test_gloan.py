@@ -380,7 +380,7 @@ class ServerAndApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         """Start the Flask WSGI server on an ephemeral localhost port."""
-        Handler.auth = Auth('debugpassword')
+        Handler.auth = Auth()
         cls.server = make_server('127.0.0.1', 0, app, threaded=True)
         port = cls.server.server_port
         cls.base_url = f'http://127.0.0.1:{port}'
@@ -397,10 +397,10 @@ class ServerAndApiTest(unittest.TestCase):
         FAILS.clear()
         os.environ.pop('GLOAN_TURNSTILE_SITE_KEY', None)
         os.environ.pop('GLOAN_TURNSTILE_SECRET_KEY', None)
-        Handler.auth = Auth('debugpassword')
         shutil.rmtree(TEST_DATA_DIR, ignore_errors=True)
         PHOTO_DIR.mkdir(parents=True, exist_ok=True)
         THUMB_DIR.mkdir(parents=True, exist_ok=True)
+        Handler.auth = Auth()
 
     def api_call(self, path: str, method: str = 'GET', body: bytes | None = None,
                  headers: dict[str, str] | None = None) -> tuple[int, Any]:
@@ -454,11 +454,31 @@ class ServerAndApiTest(unittest.TestCase):
         self.assertEqual(sniff_ext(thumb_bytes), 'jpg')
 
     def login_token(self) -> str:
-        """Log in as owner and return the bearer token."""
-        status, data = self.api_call('/api/login', 'POST', json.dumps({'password': 'debugpassword'}).encode(),
-                                     {'Content-Type': 'application/json'})
-        self.assertEqual(status, 200)
-        return data['token']
+        """Enroll a real ECDSA P-256 WebAuthn passkey (first-device setup) and return the signed owner bearer token."""
+        import hashlib
+        import struct
+
+        private_key = ec.generate_private_key(ec.SECP256R1())
+        spki_der = private_key.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        credential_id = b64url_encode(b'test-owner-passkey-1')
+        rp_id_hash = hashlib.sha256(b'127.0.0.1').digest()
+
+        status, reg_opts = self.api_call('/api/passkey/register/options', 'POST', b'')
+        self.assertEqual(status, 200, reg_opts)
+        reg_client_data = json.dumps({
+            'type': 'webauthn.create',
+            'challenge': reg_opts['challenge'],
+            'origin': self.base_url,
+        }).encode('utf-8')
+        reg_auth_data = rp_id_hash + bytes([0x05]) + struct.pack('>I', 1)
+        status, reg_reply = self.api_call('/api/passkey/register', 'POST', json.dumps({
+            'credentialId': credential_id,
+            'publicKey': b64url_encode(spki_der),
+            'clientDataJSON': b64url_encode(reg_client_data),
+            'authenticatorData': b64url_encode(reg_auth_data),
+        }).encode('utf-8'), {'Content-Type': 'application/json'})
+        self.assertEqual(status, 200, reg_reply)
+        return reg_reply['token']
 
     def test_unit_helpers(self) -> None:
         """Verify image magic-byte sniffing and IPv6-mapped IPv4 normalization."""
@@ -613,74 +633,94 @@ class ServerAndApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(scan_reply['added'], 1)
 
-    def test_passkey_webauthn_and_turnstile_and_debug_password_toggle(self) -> None:
-        """Verify WebAuthn Passkey registration + assertion login, Turnstile CAPTCHA check, and disabling password login."""
+    def test_passkey_webauthn_multi_device_and_turnstile(self) -> None:
+        """Verify multi-device WebAuthn Passkey enrollment (phone + desktop + laptop), assertion login, and Turnstile CAPTCHA."""
         import hashlib
         import struct
 
-        # 1. Generate a real ECDSA P-256 keypair (simulating the browser's hardware/OS Passkey authenticator).
-        private_key = ec.generate_private_key(ec.SECP256R1())
-        spki_der = private_key.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
-        credential_id = b64url_encode(b'test-passkey-cred-id-1234')
-        rp_id = '127.0.0.1'
-        rp_id_hash = hashlib.sha256(rp_id.encode('utf-8')).digest()
+        rp_id_hash = hashlib.sha256(b'127.0.0.1').digest()
 
-        # 2. Log in with debug password first to register the passkey.
-        debug_token = self.login_token()
-        auth_headers = {'Authorization': f'Bearer {debug_token}', 'Content-Type': 'application/json'}
-        status, reg_opts = self.api_call('/api/passkey/register/options', 'POST', b'', auth_headers)
+        # 1. Confirm password login route /api/login does not exist at all (404).
+        self.assertEqual(self.api_call('/api/login', 'POST', b'{}', {'Content-Type': 'application/json'})[0], 404)
+
+        # 2. First device (Phone) registers when no passkey exists yet.
+        phone_key = ec.generate_private_key(ec.SECP256R1())
+        phone_spki = phone_key.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        phone_cred_id = b64url_encode(b'phone-passkey-cred-id-01')
+
+        status, reg_opts1 = self.api_call('/api/passkey/register/options', 'POST', b'')
         self.assertEqual(status, 200)
-
-        reg_client_data = json.dumps({
+        reg_client_data1 = json.dumps({
             'type': 'webauthn.create',
-            'challenge': reg_opts['challenge'],
+            'challenge': reg_opts1['challenge'],
             'origin': self.base_url,
         }).encode('utf-8')
-        reg_auth_data = rp_id_hash + bytes([0x05]) + struct.pack('>I', 1)  # UP + UV flags, signCount = 1
-        status, reg_reply = self.api_call('/api/passkey/register', 'POST', json.dumps({
-            'credentialId': credential_id,
-            'publicKey': b64url_encode(spki_der),
-            'clientDataJSON': b64url_encode(reg_client_data),
-            'authenticatorData': b64url_encode(reg_auth_data),
+        reg_auth_data1 = rp_id_hash + bytes([0x05]) + struct.pack('>I', 1)
+        status, reg_reply1 = self.api_call('/api/passkey/register', 'POST', json.dumps({
+            'credentialId': phone_cred_id,
+            'publicKey': b64url_encode(phone_spki),
+            'clientDataJSON': b64url_encode(reg_client_data1),
+            'authenticatorData': b64url_encode(reg_auth_data1),
+        }).encode('utf-8'), {'Content-Type': 'application/json'})
+        self.assertEqual(status, 200, reg_reply1)
+        self.assertEqual(reg_reply1['passkeyCount'], 1)
+        owner_token = reg_reply1['token']
+
+        # Once a passkey is registered, unauthenticated callers cannot register another device (401).
+        self.assertEqual(self.api_call('/api/passkey/register/options', 'POST', b'')[0], 401)
+
+        # 3. Authenticated owner enrolls a second device (Desktop PC) without overwriting the Phone passkey.
+        desktop_key = ec.generate_private_key(ec.SECP256R1())
+        desktop_spki = desktop_key.public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        desktop_cred_id = b64url_encode(b'desktop-passkey-cred-id-02')
+        auth_headers = {'Authorization': f'Bearer {owner_token}', 'Content-Type': 'application/json'}
+
+        status, reg_opts2 = self.api_call('/api/passkey/register/options', 'POST', b'', auth_headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(reg_opts2['excludeCredentials'], [{'id': phone_cred_id, 'type': 'public-key'}])
+        reg_client_data2 = json.dumps({
+            'type': 'webauthn.create',
+            'challenge': reg_opts2['challenge'],
+            'origin': self.base_url,
+        }).encode('utf-8')
+        reg_auth_data2 = rp_id_hash + bytes([0x05]) + struct.pack('>I', 1)
+        status, reg_reply2 = self.api_call('/api/passkey/register', 'POST', json.dumps({
+            'credentialId': desktop_cred_id,
+            'publicKey': b64url_encode(desktop_spki),
+            'clientDataJSON': b64url_encode(reg_client_data2),
+            'authenticatorData': b64url_encode(reg_auth_data2),
         }).encode('utf-8'), auth_headers)
-        self.assertEqual(status, 200, reg_reply)
-        self.assertTrue(reg_reply.get('ok'))
+        self.assertEqual(status, 200, reg_reply2)
+        self.assertEqual(reg_reply2['passkeyCount'], 2)
 
-        # 3. Disable the debug password completely (production mode) and confirm /api/login returns 404.
-        Handler.auth = Auth('')
-        _, session_info = self.api_call('/api/session')
-        self.assertTrue(session_info['hasPasskey'])
-        self.assertFalse(session_info['debugPasswordEnabled'])
-        self.assertEqual(self.api_call('/api/login', 'POST',
-                                       json.dumps({'password': 'debugpassword'}).encode(),
-                                       {'Content-Type': 'application/json'})[0], 404)
-
-        # 4. Sign in using the WebAuthn Passkey assertion ceremony.
+        # 4. Both Phone and Desktop passkeys can now log in independently.
         status, login_opts = self.api_call('/api/passkey/login/options', 'POST', b'')
         self.assertEqual(status, 200)
-        self.assertEqual(login_opts['allowCredentials'][0]['id'], credential_id)
+        allowed_ids = [item['id'] for item in login_opts['allowCredentials']]
+        self.assertEqual(allowed_ids, [phone_cred_id, desktop_cred_id])
 
-        login_client_data = json.dumps({
-            'type': 'webauthn.get',
-            'challenge': login_opts['challenge'],
-            'origin': self.base_url,
-        }).encode('utf-8')
-        login_auth_data = rp_id_hash + bytes([0x05]) + struct.pack('>I', 2)  # signCount advances to 2
-        signed_payload = login_auth_data + hashlib.sha256(login_client_data).digest()
-        signature = private_key.sign(signed_payload, ec.ECDSA(hashes.SHA256()))
-
-        status, login_reply = self.api_call('/api/passkey/login', 'POST', json.dumps({
-            'credentialId': credential_id,
-            'clientDataJSON': b64url_encode(login_client_data),
-            'authenticatorData': b64url_encode(login_auth_data),
-            'signature': b64url_encode(signature),
-        }).encode('utf-8'), {'Content-Type': 'application/json'})
-        self.assertEqual(status, 200, login_reply)
-        passkey_token = login_reply['token']
-
-        # Token minted by passkey login grants owner access.
-        _, authed_session = self.api_call('/api/session', headers={'Authorization': f'Bearer {passkey_token}'})
-        self.assertTrue(authed_session['owner'])
+        for cred_id, priv_key in ((phone_cred_id, phone_key), (desktop_cred_id, desktop_key)):
+            status, opts = self.api_call('/api/passkey/login/options', 'POST', b'')
+            self.assertEqual(status, 200)
+            login_client_data = json.dumps({
+                'type': 'webauthn.get',
+                'challenge': opts['challenge'],
+                'origin': self.base_url,
+            }).encode('utf-8')
+            login_auth_data = rp_id_hash + bytes([0x05]) + struct.pack('>I', 2)
+            signature = priv_key.sign(login_auth_data + hashlib.sha256(login_client_data).digest(),
+                                      ec.ECDSA(hashes.SHA256()))
+            status, login_reply = self.api_call('/api/passkey/login', 'POST', json.dumps({
+                'credentialId': cred_id,
+                'clientDataJSON': b64url_encode(login_client_data),
+                'authenticatorData': b64url_encode(login_auth_data),
+                'signature': b64url_encode(signature),
+            }).encode('utf-8'), {'Content-Type': 'application/json'})
+            self.assertEqual(status, 200, login_reply)
+            _, authed_session = self.api_call('/api/session',
+                                              headers={'Authorization': f'Bearer {login_reply["token"]}'})
+            self.assertTrue(authed_session['owner'])
+            self.assertEqual(authed_session['passkeyCount'], 2)
 
         # 5. Replaying with a non-advancing signCount (<= 2) or bad signature is rejected with 401.
         status, login_opts2 = self.api_call('/api/passkey/login/options', 'POST', b'')
@@ -689,11 +729,11 @@ class ServerAndApiTest(unittest.TestCase):
             'challenge': login_opts2['challenge'],
             'origin': self.base_url,
         }).encode('utf-8')
-        stale_auth_data = rp_id_hash + bytes([0x05]) + struct.pack('>I', 2)  # stale signCount = 2
-        stale_sig = private_key.sign(stale_auth_data + hashlib.sha256(replay_client_data).digest(),
-                                     ec.ECDSA(hashes.SHA256()))
+        stale_auth_data = rp_id_hash + bytes([0x05]) + struct.pack('>I', 2)
+        stale_sig = phone_key.sign(stale_auth_data + hashlib.sha256(replay_client_data).digest(),
+                                   ec.ECDSA(hashes.SHA256()))
         status, _ = self.api_call('/api/passkey/login', 'POST', json.dumps({
-            'credentialId': credential_id,
+            'credentialId': phone_cred_id,
             'clientDataJSON': b64url_encode(replay_client_data),
             'authenticatorData': b64url_encode(stale_auth_data),
             'signature': b64url_encode(stale_sig),
@@ -703,13 +743,94 @@ class ServerAndApiTest(unittest.TestCase):
         # 6. When Cloudflare Turnstile keys are set, missing captchaToken is rejected before checking credentials.
         os.environ['GLOAN_TURNSTILE_SITE_KEY'] = 'site-key-123'
         os.environ['GLOAN_TURNSTILE_SECRET_KEY'] = 'secret-key-456'
-        status, login_opts3 = self.api_call('/api/passkey/login/options', 'POST', b'')
         status, err_reply = self.api_call('/api/passkey/login', 'POST', json.dumps({
-            'credentialId': credential_id,
+            'credentialId': phone_cred_id,
             'captchaToken': '',
         }).encode('utf-8'), {'Content-Type': 'application/json'})
         self.assertEqual(status, 401)
         self.assertIn('captcha', err_reply.get('error', ''))
+
+    def test_security_hardening_boundaries(self) -> None:
+        """Verify security headers, path traversal blocks, polyglot/type validation, lockout, and WebAuthn origin/crossOrigin checks."""
+        # 1. Defense-in-depth HTTP headers on responses.
+        with app.test_client() as client:
+            with client.get('/') as res:
+                self.assertEqual(res.headers.get('X-Frame-Options'), 'DENY')
+                self.assertEqual(res.headers.get('X-Content-Type-Options'), 'nosniff')
+                self.assertEqual(res.headers.get('Cross-Origin-Opener-Policy'), 'same-origin')
+                self.assertIn('max-age=31536000', res.headers.get('Strict-Transport-Security', ''))
+
+        # 2. Path traversal attempts on /photos/, /thumbs/, and /static/ must return 404.
+        for bad_path in ('/photos/..%2fphotos.json', '/photos/../photos.json', '/thumbs/..%2fpasskey.json',
+                         '/static/..%2fserver.py', '/api/photos/../../etc/passwd'):
+            status, _ = self.api_call(bad_path)
+            self.assertEqual(status, 404, f'Expected 404 for {bad_path}, got {status}')
+
+        # 3. PATCH with string instead of list for `tags` must return 400 (not split a string into single-char tags).
+        token = self.login_token()
+        auth_headers = {'Authorization': f'Bearer {token}'}
+        status, row = self.api_call('/api/photos', 'POST', TINY_JPEG,
+                                    {**auth_headers, 'Content-Type': 'image/jpeg', 'X-Title': 'Sec\x00Test'})
+        self.assertEqual(status, 201)
+        self.assertNotIn('\x00', row['title'])
+        bad_patch_status, _ = self.api_call(
+            f'/api/photos/{row["id"]}', 'PATCH',
+            json.dumps({'title': 'T', 'tags': 'not-a-list'}).encode('utf-8'),
+            {**auth_headers, 'Content-Type': 'application/json'},
+        )
+        self.assertEqual(bad_patch_status, 400)
+
+        # 4. Malformed base64 / non-DER public key on passkey register returns 400 cleanly (never 500).
+        bad_reg_status, _ = self.api_call(
+            '/api/passkey/register', 'POST',
+            json.dumps({
+                'credentialId': '!!!not_base64!!!',
+                'publicKey': '!!!',
+                'clientDataJSON': '!!!',
+                'authenticatorData': '!!!',
+            }).encode('utf-8'),
+            {**auth_headers, 'Content-Type': 'application/json'},
+        )
+        self.assertEqual(bad_reg_status, 401)
+
+        # 5. Brute-force lockout triggers after MAX_FAILS (5) bad attempts on /api/passkey/login.
+        FAILS.clear()
+        for _ in range(5):
+            st, _ = self.api_call('/api/passkey/login', 'POST',
+                                  json.dumps({'credentialId': 'invalid'}).encode('utf-8'),
+                                  {'Content-Type': 'application/json'})
+            self.assertEqual(st, 401)
+        locked_status, _ = self.api_call('/api/passkey/login/options', 'POST', b'')
+        self.assertEqual(locked_status, 429)
+
+    def test_cloud_cost_and_resource_protection(self) -> None:
+        """Verify Cloud Run / GCS FUSE cost guards: query-string limits, in-memory 404 cache checks, rpId validation, and bootstrap Turnstile."""
+        # 1. Oversized query strings (> 2048 bytes) on /api/photos and /api/tags are rejected with 414 before parse_qs.
+        huge_qs = 'q=' + ('a' * 2500)
+        self.assertEqual(self.api_call(f'/api/photos?{huge_qs}')[0], 414)
+        self.assertEqual(self.api_call(f'/api/tags?{huge_qs}')[0], 414)
+
+        # 2. Unindexed photo/thumb files on disk are rejected from memory (RowsCache) if not present in the cached snapshot.
+        _ = get_rows_cache()  # prime cache while directory is empty
+        self.assertEqual(self.api_call('/photos/p9999999999999999.jpg')[0], 404)
+        self.assertEqual(self.api_call('/thumbs/p9999999999999999.jpg')[0], 404)
+
+        # 3. Invalid Host header for WebAuthn rpId is rejected with 400.
+        self.assertEqual(
+            self.api_call('/api/passkey/register/options', 'POST', b'', {'Host': 'evil..host'})[0],
+            400,
+        )
+
+        # 4. Initial unauthenticated passkey registration requires Cloudflare Turnstile when Turnstile is configured.
+        os.environ['GLOAN_TURNSTILE_SITE_KEY'] = 'site-key-123'
+        os.environ['GLOAN_TURNSTILE_SECRET_KEY'] = 'secret-key-456'
+        status, err = self.api_call(
+            '/api/passkey/register', 'POST',
+            json.dumps({'credentialId': 'abc', 'captchaToken': ''}).encode('utf-8'),
+            {'Content-Type': 'application/json'},
+        )
+        self.assertEqual(status, 401)
+        self.assertIn('captcha', err.get('error', ''))
 
 
 if __name__ == '__main__':

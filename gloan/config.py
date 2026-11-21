@@ -29,9 +29,6 @@ PASSKEY_FILE = DATA / 'passkey.json'
 SESSION_KEY_FILE = DATA / 'session.key'
 
 
-MIN_PASSWORD = 8
-
-
 MAX_STORY = 5000
 
 

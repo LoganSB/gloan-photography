@@ -25,6 +25,8 @@ from gloan.storage import INDEX_LOCK, available_rows, load_index, save_index, th
 
 try:
     from PIL import Image, ImageOps
+    # Guard against decompression-bomb (zip-bomb) images that expand to gigabytes of RAM in Pillow.
+    Image.MAX_IMAGE_PIXELS = 60_000_000
 except ImportError:
     sys.exit('Pillow is required: pip install -r tools/requirements.txt')
 

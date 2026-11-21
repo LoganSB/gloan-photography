@@ -13,12 +13,15 @@ from werkzeug.exceptions import HTTPException
 from gloan.auth import (
     Auth,
     FAILS,
+    FAILS_LOCK,
+    MAX_TRACKED_IPS,
     has_passkey,
     issue_webauthn_challenge,
-    load_passkey,
+    load_passkeys,
     normalize_ip,
     register_passkey_credential,
     turnstile_site_key,
+    validate_rp_id,
     verify_passkey_assertion,
     verify_turnstile,
 )
@@ -45,6 +48,7 @@ from gloan.storage import (
     clean_story,
     clean_tags,
     clean_title,
+    get_rows_cache,
     load_index,
     public_row,
     save_index,
@@ -53,6 +57,8 @@ from gloan.storage import (
 )
 from gloan.tags import suggest_tags
 from gloan.thumbtool import start_thumbnail_job, thumbnail_status
+
+MAX_QUERY_STRING_BYTES = 2048
 
 
 # Strict Content-Security-Policy enabled by moving all CSS and JavaScript out of index.html into /static/.
@@ -79,7 +85,7 @@ class Handler:
     """
 
     server_version = 'Gloan/1.0'
-    auth: Auth = Auth('debugpassword')
+    auth: Auth = Auth()
     proxy_header: str | None = None
     proxy_hops: int = 1
     proxy_any_peer: bool = False
@@ -128,7 +134,11 @@ def require_owner() -> Response | None:
 
 
 def read_body(limit: int) -> tuple[bytes | None, Response | None]:
-    """Read a bounded request body; require an explicit Content-Length within [0, limit]."""
+    """Read a bounded request body; require an explicit Content-Length within [0, limit].
+
+    Reads exactly `length` bytes (already verified to be `<= limit`) from the WSGI input stream so a client
+    cannot send an unbounded body or bypass the size cap.
+    """
     raw_length = request.headers.get('Content-Length', '')
     try:
         length = int(raw_length)
@@ -136,22 +146,37 @@ def read_body(limit: int) -> tuple[bytes | None, Response | None]:
         return None, fail(411, 'Content-Length required')
     if not 0 <= length <= limit:
         return None, fail(413, 'body too large')
-    return request.get_data(cache=False), None
+    if length == 0:
+        return b'', None
+    stream = request.environ.get('wsgi.input')
+    data = stream.read(length) if stream is not None else request.get_data(cache=False)
+    if len(data) != length:
+        return None, fail(400, 'body size mismatch')
+    return data, None
 
 
 @app.after_request
 def apply_security_headers(response: Response) -> Response:
     """Attach security headers and default cache policy to every HTTP response."""
     response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    response.headers['Cross-Origin-Opener-Policy'] = 'same-origin'
+    response.headers['Cross-Origin-Resource-Policy'] = 'same-origin'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     response.headers['Content-Security-Policy'] = CONTENT_SECURITY_POLICY
     response.headers.setdefault('Cache-Control', 'no-store')
     return response
 
 
-@app.errorhandler(HTTPException)
-def handle_http_exception(error: HTTPException) -> Response:
-    """Return JSON errors rather than Flask's default HTML error pages."""
-    return fail(error.code or 500, 'not found' if error.code == 404 else (error.description or 'request failed'))
+@app.errorhandler(Exception)
+def handle_exception(error: Exception) -> Response:
+    """Return JSON errors rather than Flask's default HTML error pages, without leaking tracebacks."""
+    if isinstance(error, HTTPException):
+        return fail(error.code or 500, 'not found' if error.code == 404 else (error.description or 'request failed'))
+    LOGGER.exception('Unhandled server error')
+    return fail(500, 'internal server error')
 
 
 # -- Pages & Static Assets ---------------------------------------------------
@@ -175,9 +200,13 @@ def serve_static(filename: str) -> Response:
 
 @app.get('/thumbs/<filename>')
 def serve_thumbnail(filename: str) -> Response:
-    """Serve a generated 480px JPEG tile from THUMB_DIR."""
+    """Serve a generated 480px JPEG tile from THUMB_DIR.
+
+    Checks the in-memory RowsCache (`thumb_names`) before touching the filesystem so 404 probes for non-existent
+    thumbnail IDs cost zero Cloud Storage FUSE lookup operations.
+    """
     match = THUMB_FILE_RE.match(filename)
-    if not match:
+    if not match or match.group(0) not in get_rows_cache().thumb_names:
         return fail(404, 'not found')
     path = THUMB_DIR / match.group(0)
     if not path.is_file():
@@ -189,9 +218,13 @@ def serve_thumbnail(filename: str) -> Response:
 
 @app.get('/photos/<filename>')
 def serve_photo(filename: str) -> Response:
-    """Stream a full-size photo file with ETag/Range support and immutable caching."""
+    """Stream a full-size photo file with ETag/Range support and immutable caching.
+
+    Checks the in-memory RowsCache (`photo_sizes`) before touching the filesystem so 404 probes for non-existent
+    photo IDs cost zero Cloud Storage FUSE lookup operations.
+    """
     match = FILE_RE.match(filename)
-    if not match:
+    if not match or match.group(0) not in get_rows_cache().photo_sizes:
         return fail(404, 'not found')
     path = PHOTO_DIR / match.group(0)
     if not path.is_file():
@@ -205,19 +238,21 @@ def serve_photo(filename: str) -> Response:
 
 @app.get('/api/session')
 def api_session() -> Response:
-    """Report whether the caller is logged in, whether a passkey exists, Turnstile site key and debug password mode."""
+    """Report whether the caller is logged in, whether a passkey exists, how many devices are enrolled, and Turnstile site key."""
+    passkeys = load_passkeys()
     return jsonify({
         'owner': is_owner(),
-        'hasPasskey': has_passkey(),
+        'hasPasskey': len(passkeys) > 0,
+        'passkeyCount': len(passkeys),
         'turnstileSiteKey': turnstile_site_key(),
-        # DEBUG WORKAROUND FLAG: remove once passkey is verified in production and debug password is retired
-        'debugPasswordEnabled': Handler.auth.debug_password_enabled,
     })
 
 
 @app.get('/api/photos')
 def api_list_photos() -> Response:
     """Return one filtered, sorted page of photos and gallery-wide tag counts."""
+    if len(request.query_string) > MAX_QUERY_STRING_BYTES:
+        return fail(414, 'query string too long')
     params = parse_qs(request.query_string.decode('utf-8', errors='replace'))
     return jsonify(query_photos(params))
 
@@ -225,6 +260,8 @@ def api_list_photos() -> Response:
 @app.get('/api/tags')
 def api_suggest_tags() -> Response:
     """Return ranked, typo-tolerant tag suggestions from the cached TagIndex."""
+    if len(request.query_string) > MAX_QUERY_STRING_BYTES:
+        return fail(414, 'query string too long')
     params = parse_qs(request.query_string.decode('utf-8', errors='replace'))
     limit = parse_int((params.get('limit') or [None])[0], DEFAULT_TAG_SUGGESTIONS, 1, MAX_TAG_SUGGESTIONS)
     query_text = (params.get('q') or [''])[0]
@@ -268,17 +305,27 @@ def api_rescan() -> Response:
 
 def _check_rate_limit(requester_ip: str) -> Response | None:
     """Return a 429 error response if `requester_ip` is currently locked out after repeated login failures."""
-    _, locked_until = FAILS.get(requester_ip, (0, 0.0))
-    if locked_until > time.time():
+    now = time.time()
+    with FAILS_LOCK:
+        _, locked_until = FAILS.get(requester_ip, (0, 0.0))
+    if locked_until > now:
         return fail(429, 'too many attempts, try again shortly')
     return None
 
 
 def _record_login_failure(requester_ip: str, message: str = 'authentication failed') -> Response:
     """Increment the failure counter for `requester_ip`, lock out at MAX_FAILS, and return a 401 response."""
-    count, _ = FAILS.get(requester_ip, (0, 0.0))
-    count += 1
-    FAILS[requester_ip] = (count, time.time() + LOCK_SECONDS if count >= MAX_FAILS else 0.0)
+    now = time.time()
+    with FAILS_LOCK:
+        if len(FAILS) >= MAX_TRACKED_IPS and requester_ip not in FAILS:
+            expired = [ip for ip, (_, until) in FAILS.items() if until <= now]
+            for ip in expired:
+                FAILS.pop(ip, None)
+            if len(FAILS) >= MAX_TRACKED_IPS:
+                FAILS.pop(next(iter(FAILS)), None)
+        count, _ = FAILS.get(requester_ip, (0, 0.0))
+        count += 1
+        FAILS[requester_ip] = (count, now + LOCK_SECONDS if count >= MAX_FAILS else 0.0)
     return fail(401, message)
 
 
@@ -286,25 +333,39 @@ def _record_login_failure(requester_ip: str, message: str = 'authentication fail
 def api_passkey_register_options() -> Response:
     """Issue a WebAuthn registration challenge.
 
-    Allowed when the caller is already logged in as owner (e.g. via the debug password or an existing passkey)
-    OR during initial setup when no passkey has been registered yet and no debug password is required.
+    Allowed when no passkey exists yet (initial first-device bootstrap) OR when the caller is already signed in
+    with an existing passkey (to enroll additional devices like a desktop or laptop).
     """
-    if has_passkey() or Handler.auth.debug_password_enabled:
+    requester_ip = client_ip()
+    lockout_error = _check_rate_limit(requester_ip)
+    if lockout_error:
+        return lockout_error
+    if has_passkey():
         auth_error = require_owner()
         if auth_error:
             return auth_error
-    rp_id = (request.host or 'localhost').split(':', 1)[0].strip().lower()
+    try:
+        rp_id = validate_rp_id(request.host or 'localhost')
+    except ValueError as error:
+        return fail(400, str(error))
+    exclude_credentials = [{'id': item['credentialId'], 'type': 'public-key'} for item in load_passkeys()]
     return jsonify({
         'challenge': issue_webauthn_challenge('register'),
         'rp': {'name': 'Gloan Photography', 'id': rp_id},
         'user': {'id': 'gloan-owner', 'name': 'owner', 'displayName': 'Gloan Owner'},
+        'excludeCredentials': exclude_credentials,
     })
 
 
 @app.post('/api/passkey/register')
 def api_passkey_register() -> Response:
     """Verify and store the owner's newly created WebAuthn Passkey credential."""
-    if has_passkey() or Handler.auth.debug_password_enabled:
+    requester_ip = client_ip()
+    lockout_error = _check_rate_limit(requester_ip)
+    if lockout_error:
+        return lockout_error
+    already_has_passkey = has_passkey()
+    if already_has_passkey:
         auth_error = require_owner()
         if auth_error:
             return auth_error
@@ -315,27 +376,34 @@ def api_passkey_register() -> Response:
         payload = json.loads(raw_body)
         if not isinstance(payload, dict):
             raise ValueError('expected JSON object')
+        if not already_has_passkey and not verify_turnstile(str(payload.get('captchaToken', '')), requester_ip):
+            return _record_login_failure(requester_ip, 'captcha verification failed')
         register_passkey_credential(payload, request.host or 'localhost')
     except (ValueError, TypeError) as error:
-        return fail(400, str(error))
-    return jsonify({'ok': True, 'token': Handler.auth.issue()})
+        return _record_login_failure(requester_ip, str(error))
+    with FAILS_LOCK:
+        FAILS.pop(requester_ip, None)
+    return jsonify({'ok': True, 'token': Handler.auth.issue(), 'passkeyCount': len(load_passkeys())})
 
 
 @app.post('/api/passkey/login/options')
 def api_passkey_login_options() -> Response:
-    """Issue a WebAuthn login challenge and return the registered credentialId."""
+    """Issue a WebAuthn login challenge and return all registered credentialIds."""
     requester_ip = client_ip()
     lockout_error = _check_rate_limit(requester_ip)
     if lockout_error:
         return lockout_error
-    stored = load_passkey()
+    stored = load_passkeys()
     if not stored:
         return fail(404, 'no passkey registered yet')
-    rp_id = (request.host or 'localhost').split(':', 1)[0].strip().lower()
+    try:
+        rp_id = validate_rp_id(request.host or 'localhost')
+    except ValueError as error:
+        return fail(400, str(error))
     return jsonify({
         'challenge': issue_webauthn_challenge('login'),
         'rpId': rp_id,
-        'allowCredentials': [{'id': stored['credentialId'], 'type': 'public-key'}],
+        'allowCredentials': [{'id': item['credentialId'], 'type': 'public-key'} for item in stored],
     })
 
 
@@ -361,40 +429,9 @@ def api_passkey_login() -> Response:
         verify_passkey_assertion(payload, request.host or 'localhost')
     except (ValueError, TypeError) as error:
         return _record_login_failure(requester_ip, str(error))
-    FAILS.pop(requester_ip, None)
-    return jsonify({'token': Handler.auth.issue()})
-
-
-# ============================================================================
-# DEBUG PASSWORD WORKAROUND ROUTE (REMOVE AFTER CLOUD PASSKEY VERIFICATION)
-# Exchanges the debug password (+ Turnstile token if enabled) for a session
-# token so you can log in during local Docker debug or first cloud setup to
-# register your Passkey. Returns 404 when debug_password_enabled is False.
-# ============================================================================
-@app.post('/api/login')
-def api_login() -> Response:
-    """Exchange the debug owner password for a signed token (only active when GLOAN_PASSWORD is set)."""
-    if not Handler.auth.debug_password_enabled:
-        return fail(404, 'password login disabled; use passkey')
-    requester_ip = client_ip()
-    lockout_error = _check_rate_limit(requester_ip)
-    if lockout_error:
-        return lockout_error
-    raw_body, body_error = read_body(4096)
-    if body_error:
-        return body_error
-    try:
-        payload = json.loads(raw_body or b'')
-        given_password = str(payload.get('password', ''))
-        captcha_token = str(payload.get('captchaToken', ''))
-    except (ValueError, AttributeError):
-        return fail(400, 'bad json')
-    if not verify_turnstile(captcha_token, requester_ip):
-        return _record_login_failure(requester_ip, 'captcha verification failed')
-    if Handler.auth.check_password(given_password):
+    with FAILS_LOCK:
         FAILS.pop(requester_ip, None)
-        return jsonify({'token': Handler.auth.issue()})
-    return _record_login_failure(requester_ip, 'wrong password')
+    return jsonify({'token': Handler.auth.issue()})
 
 
 @app.post('/api/photos')
@@ -442,8 +479,13 @@ def api_update_photo(photo_id: str) -> Response:
         return body_error or fail(400, 'bad json')
     try:
         body = json.loads(raw_body)
+        if not isinstance(body, dict):
+            raise ValueError('expected JSON object')
+        raw_tags = body.get('tags', [])
+        if not isinstance(raw_tags, list):
+            raise ValueError('tags must be a list')
         title = clean_title(body.get('title', ''))
-        tags = clean_tags(body.get('tags', []))
+        tags = clean_tags(raw_tags)
     except (ValueError, AttributeError, TypeError):
         return fail(400, 'bad json')
     with INDEX_LOCK:
