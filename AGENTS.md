@@ -10,6 +10,7 @@ Read this file and [SYSTEMS.md](SYSTEMS.md) before changing anything.
 4. **Keep it simple.** The web server uses Flask + Gunicorn (`requirements.txt`); Pillow is used only by `tools/make_thumbnails.py`; the frontend is `index.html` + `static/app.css` + native ES modules in `static/*.js` (no bundler or build step). Do not add dependencies or build steps without asking the user.
 5. **Match existing style** in the file you edit. Don't reformat unrelated code.
 6. **Use Git Branches** for Significant changes or new features. Avoid directly modifying while on origin main except for small changes.
+7. **No emojis without asking.** Do not use emojis or decorative icon symbols in UI text, buttons, badges, or messages — only the slideshow play/pause symbol (`▶` / `❚❚`) is permitted. Whenever adding or changing UI text where an emoji might be used, prompt the user first to ask whether they want an emoji or plain text.
 
 ## Tool & language review (every request)
 

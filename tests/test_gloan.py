@@ -176,9 +176,14 @@ class FrontendSyntaxTest(unittest.TestCase):
         upload_source = (static_dir / 'upload.js').read_text(encoding='utf-8')
         self.assertNotIn('runThumbnailJob(', upload_source)
 
-        # Verify instant-response UI loading indicators exist in HTML, CSS and JS modules.
+        # Verify instant-response UI loading indicators and emoji-free UI text (except ▶/❚❚ on slideshow).
         self.assertIn('id="lbLoader"', html_text)
         self.assertIn('Loading image…', html_text)
+        for forbidden_emoji in ('📖', '🔓', '🔒', '🗑', '✎', '⛶', '＋'):
+            self.assertNotIn(forbidden_emoji, html_text)
+            for js_file in js_files:
+                self.assertNotIn(forbidden_emoji, js_file.read_text(encoding='utf-8'))
+        self.assertIn('▶', html_text)
         css_source = (static_dir / 'app.css').read_text(encoding='utf-8')
         self.assertIn('.spinner', css_source)
         self.assertIn('.card-loader', css_source)
@@ -187,6 +192,7 @@ class FrontendSyntaxTest(unittest.TestCase):
         self.assertIn('card-loader', gallery_source)
         self.assertIn('Loading image…', gallery_source)
         self.assertIn("match: 'all'", gallery_source)
+        self.assertIn('TILE_LOAD_CONCURRENCY', gallery_source)
         lightbox_source = (static_dir / 'lightbox.js').read_text(encoding='utf-8')
         self.assertIn("classList.add('loading')", lightbox_source)
         self.assertIn('pauseGalleryImageLoads()', lightbox_source)
@@ -544,11 +550,13 @@ class ServerAndApiTest(unittest.TestCase):
             {'Authorization': f'Bearer {token}', 'Content-Type': 'image/jpeg', 'X-Title': 'T',
              'X-Tags': 'landscape,lake'})
         self.assertEqual(status, 201)
+        self.assertGreaterEqual(len(row.get('aiTags', [])), 5)
         status, reply = self.api_call('/api/tags?q=landscpe')
         self.assertEqual(status, 200)
         self.assertEqual(reply['suggestions'][0], {'tag': 'landscape', 'count': 1, 'match': 'fuzzy'})
         _, reply = self.api_call('/api/tags?q=&limit=999')
-        self.assertEqual(len(reply['suggestions']), 2)
+        self.assertGreaterEqual(len(reply['suggestions']), 5)
+        self.assertLessEqual(len(reply['suggestions']), 20)
 
         # Editing tags must invalidate the cached index right away.
         self.api_call(f'/api/photos/{row["id"]}', 'PATCH', json.dumps({'title': 'T', 'tags': ['river']}).encode(),
@@ -626,12 +634,44 @@ class ServerAndApiTest(unittest.TestCase):
         self.assertEqual(self.api_call('/api/thumbnails', 'GET')[0], 401)
         self.assertEqual(self.api_call('/api/thumbnails', 'POST', b'')[0], 401)
 
-        # Authenticated rescan adopts a hand-copied file.
+        # Authenticated rescan adopts a hand-copied file and AI-tags it with at least 5 tags.
         (PHOTO_DIR / 'Copied_Photo.jpg').write_bytes(TINY_JPEG)
         token = self.login_token()
         status, scan_reply = self.api_call('/api/rescan', 'POST', b'', {'Authorization': f'Bearer {token}'})
         self.assertEqual(status, 200)
         self.assertEqual(scan_reply['added'], 1)
+        self.assertEqual(scan_reply['aiTagged'], 1)
+        saved_rows = load_index()
+        self.assertEqual(len(saved_rows), 1)
+        self.assertGreaterEqual(len(saved_rows[0].get('aiTags', [])), 5)
+        for ai_tag in saved_rows[0]['aiTags']:
+            self.assertIn(ai_tag, saved_rows[0]['tags'])
+
+        # A second rescan skips photos that already have aiTags recorded in photos.json (0 redundant work/cost).
+        status2, scan_reply2 = self.api_call('/api/rescan', 'POST', b'', {'Authorization': f'Bearer {token}'})
+        self.assertEqual(status2, 200)
+        self.assertEqual(scan_reply2['added'], 0)
+        self.assertEqual(scan_reply2['aiTagged'], 0)
+
+        # Existing photos in photos.json without aiTags get tagged on manual admin rescan.
+        (PHOTO_DIR / 'p2222222222222222.jpg').write_bytes(TINY_JPEG)
+        rows = load_index()
+        rows.append({
+            'id': 'p2222222222222222',
+            'ext': 'jpg',
+            'title': 'Sunset Canyon Trail',
+            'tags': ['utah'],
+            'story': '',
+            'added': 1700000000000,
+        })
+        save_index(rows)
+        status3, scan_reply3 = self.api_call('/api/rescan', 'POST', b'', {'Authorization': f'Bearer {token}'})
+        self.assertEqual(status3, 200)
+        self.assertEqual(scan_reply3['aiTagged'], 1)
+        untagged_now = next(item for item in load_index() if item['id'] == 'p2222222222222222')
+        self.assertGreaterEqual(len(untagged_now.get('aiTags', [])), 5)
+        self.assertIn('utah', untagged_now['tags'])
+        self.assertIn('sunset', untagged_now['tags'])
 
     def test_passkey_webauthn_multi_device_and_turnstile(self) -> None:
         """Verify multi-device WebAuthn Passkey enrollment (phone + desktop + laptop), assertion login, and Turnstile CAPTCHA."""

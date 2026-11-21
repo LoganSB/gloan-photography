@@ -99,8 +99,8 @@ export function isOwner() {
 export function setOwner(enabled, shouldRender = true) {
   document.body.classList.toggle('owner', enabled);
   select('#authBtn').innerHTML = enabled
-    ? '🔓 <span class="lbl">Log out</span>'
-    : ' <span class="lbl">Admin login</span>';
+    ? '<span class="lbl">Log out</span>'
+    : '<span class="lbl">Admin login</span>';
   if (shouldRender && onOwnerChangedCallback) {
     onOwnerChangedCallback();
   }

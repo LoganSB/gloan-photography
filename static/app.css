@@ -175,4 +175,4 @@ footer{border-top:1px solid var(--line);padding:26px 0;color:var(--muted);font-s
 @media(max-width:760px){.story{left:12px;right:12px;top:auto;bottom:150px;width:auto;max-height:42%}.lb.story-open .stagebox{padding-right:0}}
 .toast{position:fixed;bottom:24px;left:50%;transform:translate(-50%,20px);background:var(--accent);color:var(--accent-ink);padding:10px 18px;border-radius:99px;opacity:0;transition:.3s;z-index:200;font-size:13.5px;pointer-events:none}
 .toast.show{opacity:1;transform:translate(-50%,0)}
-@media(max-width:640px){.wrap{padding:0 16px}.btn span.lbl{display:none}.hero{padding-top:44px}.mode{margin-left:0;width:100%}.nav{display:none}.stagebox{padding:8px 12px}}
+@media(max-width:640px){.wrap{padding:0 16px}#slideBtn span.lbl{display:none}.hero{padding-top:44px}.mode{margin-left:0;width:100%}.nav{display:none}.stagebox{padding:8px 12px}}

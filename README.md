@@ -79,8 +79,9 @@ network in the clear.
 | GET | `/thumbs/<id>.jpg` | public |
 | GET | `/api/thumbnails` (job status: `running`, `exitCode`, `output`, `missing`) | owner |
 | POST | `/api/thumbnails` (starts `tools/make_thumbnails.py` in the background) | owner |
-| POST | `/api/photos` raw image body, `X-Title` / `X-Tags` URL-encoded headers | owner |
-| PATCH | `/api/photos/<id>` `{"title","tags"}` | owner |
+| POST | `/api/rescan` (adopts manually copied images from `data/photos/` and runs the AI tag bot on any photo missing `aiTags`) -> `{"added","aiTagged","skipped","indexed"}` | owner |
+| POST | `/api/photos` raw image body, `X-Title` / `X-Tags` URL-encoded headers (automatically adds 5+ AI tags and records `aiTags` in `photos.json`) | owner |
+| PATCH | `/api/photos/<id>` `{"title","tags","story"}` | owner |
 | DELETE | `/api/photos/<id>` | owner |
 
 Owner calls send `Authorization: Bearer <token>`; tokens last 12 hours.

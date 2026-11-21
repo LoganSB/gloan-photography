@@ -228,10 +228,11 @@ def available_rows() -> list[Row]:
 def thumb_path(row: Row) -> Path | None:
     """Path of a photo's tile image, or None when it has none yet (or the stored name looks wrong).
 
-    photos.json links tile to original through row['thumb'] (a file name inside THUMB_DIR). The name is
-    re-validated against THUMB_FILE_RE so a hand-edited index can never point outside THUMB_DIR.
+    Checks `row['thumb']` first and falls back to the canonical `<id>.jpg` filename in `THUMB_DIR` so tiles
+    present on the Cloud Storage bucket are served immediately even before `photos.json` is rewritten.
+    The name is validated against THUMB_FILE_RE so a hand-edited index can never point outside THUMB_DIR.
     """
-    name = row.get('thumb')
+    name = row.get('thumb') or f'{row["id"]}.jpg'
     match = THUMB_FILE_RE.match(name) if isinstance(name, str) else None
     if not match or match.group(1) != row['id']:
         return None
@@ -242,10 +243,12 @@ def thumb_path(row: Row) -> Path | None:
 
 
 def public_row(row: Row) -> Row:
-    """Row as the API exposes it, with image URL, tile URL (None until generated) and file size (bytes)."""
+    """Row as the API exposes it, with image URL, tile URL (None until generated), AI tags list and file size (bytes)."""
     thumb = thumb_path(row)
     return {
-        'story': '', **row,
+        'story': '',
+        'aiTags': [],
+        **row,
         'url': f'/photos/{row["id"]}.{row["ext"]}',
         'thumbUrl': f'/thumbs/{thumb.name}' if thumb else None,
         'size': file_size(row),

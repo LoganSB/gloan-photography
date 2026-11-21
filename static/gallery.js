@@ -36,24 +36,28 @@ export const state = {
   suggestionCache: new Map(),
 };
 
-let imageLoadRun = 0;  // bumped on every render or lightbox open so a sequential tile load yields immediately
-let activeTileImage = null; // the tile <img> currently downloading, so openLightbox can abort it and free sockets
+const TILE_LOAD_CONCURRENCY = 4; // parallel tile worker lanes so one huge un-thumbnailed file never blocks the rest
+
+let imageLoadRun = 0;  // bumped on every render or lightbox open so tile downloads yield immediately
+const activeTileImages = new Set(); // all tile <img> elements currently downloading, so openLightbox can abort them
 let currentGalleryEl = null;
 let refreshRun = 0;    // bumped per fetch so a slow, outdated response cannot overwrite a newer one
 
 /**
- * Abort any in-flight sequential tile download so a lightbox full-resolution image request never waits in the
+ * Abort any in-flight gallery tile downloads so a lightbox full-resolution image request never waits in the
  * browser's per-origin TCP socket queue behind a slow un-thumbnailed image.
  */
 export function pauseGalleryImageLoads() {
   imageLoadRun++;
-  if (activeTileImage && !activeTileImage.complete) {
-    const cancelHandler = activeTileImage.onerror;
-    activeTileImage.onload = activeTileImage.onerror = null;
-    activeTileImage.removeAttribute('src');
-    if (typeof cancelHandler === 'function') cancelHandler();
+  for (const img of activeTileImages) {
+    if (!img.complete) {
+      const cancelHandler = img.onerror;
+      img.onload = img.onerror = null;
+      img.removeAttribute('src');
+      if (typeof cancelHandler === 'function') cancelHandler();
+    }
   }
-  activeTileImage = null;
+  activeTileImages.clear();
 }
 
 /**
@@ -176,37 +180,48 @@ export function buildPager() {
 }
 
 /**
- * Fetch the current page's tile images one at a time in reading order (top-left first).
- * Each image receives its src only after the previous one finishes so off-page images never load.
+ * Fetch the current page's tile images in reading order (top-left first) using bounded concurrency (4 lanes),
+ * prioritizing lightweight `/thumbs/` tiles ahead of any un-thumbnailed `/photos/` originals so a single 50 MB
+ * un-thumbnailed image can never stall the remaining cards on the page.
  */
 export async function loadImagesInOrder(galleryElement) {
   const runId = ++imageLoadRun;
-  const cards = [...galleryElement.querySelectorAll('.card')];
-  // Sort by visual on-screen coordinates (row, then column) because CSS masonry runs down columns first.
+  const cards = [...galleryElement.querySelectorAll('.card')].filter(card => !card.classList.contains('loaded'));
+  // Sort lightweight thumbnails before full-size fallback originals, then by visual on-screen (row, column).
   const screenPosition = card => {
     const rect = card.getBoundingClientRect();
-    return [Math.round(rect.top / 20), rect.left];
+    const src = card.querySelector('img')?.dataset.src || '';
+    const isFullOriginal = src.startsWith('/photos/') ? 1 : 0;
+    return [isFullOriginal, Math.round(rect.top / 20), rect.left];
   };
   cards.sort((cardA, cardB) => {
-    const [rowA, colA] = screenPosition(cardA);
-    const [rowB, colB] = screenPosition(cardB);
-    return rowA - rowB || colA - colB;
+    const [origA, rowA, colA] = screenPosition(cardA);
+    const [origB, rowB, colB] = screenPosition(cardB);
+    return origA - origB || rowA - rowB || colA - colB;
   });
-  for (const card of cards) {
-    if (runId !== imageLoadRun) return; // superseded by a newer render or paused by openLightbox
-    if (card.classList.contains('loaded')) continue;
-    const image = card.querySelector('img');
-    activeTileImage = image;
-    await new Promise(done => {
-      image.onload = () => {
-        card.classList.add('loaded');
-        done();
-      };
-      image.onerror = done;
-      image.src = image.dataset.src;
-    });
-    activeTileImage = null;
-  }
+
+  let nextIndex = 0;
+  const loadWorker = async () => {
+    while (nextIndex < cards.length) {
+      if (runId !== imageLoadRun) return; // superseded by a newer render or paused by openLightbox
+      const card = cards[nextIndex++];
+      if (!card || card.classList.contains('loaded')) continue;
+      const image = card.querySelector('img');
+      activeTileImages.add(image);
+      await new Promise(done => {
+        image.onload = () => {
+          card.classList.add('loaded');
+          done();
+        };
+        image.onerror = done;
+        image.src = image.dataset.src;
+      });
+      activeTileImages.delete(image);
+    }
+  };
+
+  const laneCount = Math.min(TILE_LOAD_CONCURRENCY, cards.length);
+  await Promise.all(Array.from({ length: laneCount }, () => loadWorker()));
 }
 
 /**
@@ -281,7 +296,7 @@ export function render() {
   if (!state.photoTotal) {
     host.innerHTML = isOwner()
       ? `<div class="empty"><h2>Your gallery is empty</h2><p>Upload your first photos, or load a few generated samples to try the site out.</p>
-      <div class="row"><button class="btn primary" id="e1">＋ Upload photos</button><button class="btn" id="e2">Load sample images</button></div></div>`
+      <div class="row"><button class="btn primary" id="e1">Upload photos</button><button class="btn" id="e2">Load sample images</button></div></div>`
       : '<div class="empty"><h2>No photos yet</h2><p>Check back soon.</p></div>';
     if (isOwner()) {
       select('#e1').onclick = () => cardHandlers.openUpload();
@@ -297,9 +312,9 @@ export function render() {
   const galleryEl = createElement('div', 'gallery' + (state.layout === 'uniform' ? ' uniform' : ''));
   state.view.forEach((photo, index) => {
     const card = createElement('div', 'card in');
-    const storyBadge = photo.story ? '<div class="sb">📖 Read the story</div>' : '';
+    const storyBadge = photo.story ? '<div class="sb">Read the story</div>' : '';
     const tagPills = photo.tags.map(tag => `<span>${escapeHtml(tag)}</span>`).join('');
-    card.innerHTML = `<div class="card-loader"><span class="spinner" aria-hidden="true"></span><span>Loading image…</span></div><img data-src="${photo.thumbUrl || photo.url}" alt="${escapeHtml(photo.title || '')}"><div class="ov"><button class="btn owner-only addtag">＋ tags</button><h3>${escapeHtml(photo.title || 'Untitled')}</h3>${storyBadge}<div class="t">${tagPills}</div></div>`;
+    card.innerHTML = `<div class="card-loader"><span class="spinner" aria-hidden="true"></span><span>Loading image…</span></div><img data-src="${photo.thumbUrl || photo.url}" alt="${escapeHtml(photo.title || '')}"><div class="ov"><button class="btn owner-only addtag">+ tags</button><h3>${escapeHtml(photo.title || 'Untitled')}</h3>${storyBadge}<div class="t">${tagPills}</div></div>`;
     card.querySelector('.addtag').onclick = event => {
       event.stopPropagation(); // don't also open the lightbox when clicking "+ tags"
       cardHandlers.openTagModal(photo);
@@ -380,8 +395,11 @@ export async function rescanFolder() {
       const result = await API.call('POST', '/api/rescan');
       state.page = 0;
       await refresh();
+      const aiNote = result.aiTagged ? `, AI tagged ${result.aiTagged}` : '';
       if (result.added) {
-        toast(`Added ${result.added} photo${result.added > 1 ? 's' : ''} from the folder`);
+        toast(`Added ${result.added} photo${result.added > 1 ? 's' : ''} from the folder${aiNote}`);
+      } else if (result.aiTagged) {
+        toast(`AI tagged ${result.aiTagged} photo${result.aiTagged > 1 ? 's' : ''}`);
       } else {
         const skippedText = result.skipped.length ? '; skipped: ' + result.skipped.join(', ') : '';
         toast(`No new photos found (${result.indexed} already listed${skippedText})`);

@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, unquote
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 from werkzeug.exceptions import HTTPException
 
+from gloan.aitags import apply_ai_tags_to_row, tag_untagged_photos
 from gloan.auth import (
     Auth,
     FAILS,
@@ -292,15 +293,16 @@ def api_start_thumbnails() -> Response:
 
 @app.post('/api/rescan')
 def api_rescan() -> Response:
-    """Scan data/photos/ for manually copied images and adopt them into photos.json."""
+    """Scan data/photos/ for manually copied images, adopt them into photos.json, and AI-tag any untagged photos."""
     auth_error = require_owner()
     if auth_error:
         return auth_error
     skipped: list[str] = []
     added = scan_folder(skipped)
+    ai_tagged = tag_untagged_photos()
     indexed_count = len(load_index())
-    LOGGER.info('Scan: added %d, skipped %s, indexed %d', added, skipped, indexed_count)
-    return jsonify({'added': added, 'skipped': skipped[:10], 'indexed': indexed_count})
+    LOGGER.info('Scan: added %d, aiTagged %d, skipped %s, indexed %d', added, ai_tagged, skipped, indexed_count)
+    return jsonify({'added': added, 'aiTagged': ai_tagged, 'skipped': skipped[:10], 'indexed': indexed_count})
 
 
 def _check_rate_limit(requester_ip: str) -> Response | None:
@@ -457,6 +459,7 @@ def api_upload_photo() -> Response:
     }
     PHOTO_DIR.mkdir(parents=True, exist_ok=True)
     (PHOTO_DIR / f'{photo_id}.{ext}').write_bytes(data)
+    apply_ai_tags_to_row(row, raw_bytes=data)
     with INDEX_LOCK:
         rows = load_index()
         rows.append(row)
