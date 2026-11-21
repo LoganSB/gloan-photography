@@ -147,19 +147,18 @@ export function goSlide(delta) {
 
 /**
  * Rebuild the bottom thumbnail strip for the photos on the current page.
- * Only assigns `src` when a lightweight `thumbUrl` tile exists so opening the lightbox never triggers
- * 10 concurrent multi-megabyte full-image downloads that saturate browser sockets.
+ * Uses `photo.thumbUrl` when available, or falls back to `photo.url` with `loading="lazy"` so strip tiles still
+ * render even before `tools/make_thumbnails.py` has been run on the bucket.
  */
 export function buildStrip() {
   const stripEl = select('#strip');
   stripEl.innerHTML = '';
   state.view.forEach((photo, index) => {
     const thumbImg = createElement('img');
-    if (photo.thumbUrl) {
-      thumbImg.src = photo.thumbUrl;
-    } else {
-      thumbImg.alt = photo.title || 'Untitled';
-    }
+    thumbImg.loading = 'lazy';
+    thumbImg.decoding = 'async';
+    thumbImg.src = photo.thumbUrl || photo.url;
+    thumbImg.alt = photo.title || 'Untitled';
     thumbImg.onclick = () => {
       currentIndex = index;
       showSlide();

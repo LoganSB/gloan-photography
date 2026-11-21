@@ -201,9 +201,21 @@ class FrontendSyntaxTest(unittest.TestCase):
         node_candidates = [shutil.which('node'), '/mnt/c/Program Files/nodejs/node.exe', 'C:/Program Files/nodejs/node.exe']
         node_binary = next((candidate for candidate in node_candidates if candidate and Path(candidate).exists()), None)
 
+        all_sources = html_text + '\n' + '\n'.join(p.read_text(encoding='utf-8') for p in js_files)
+        defined_ids = set(re.findall(r'\bid="([^"]+)"', all_sources))
         for js_path in js_files:
             source = js_path.read_text(encoding='utf-8')
             self.assert_valid_javascript_literals(source, js_path.name)
+            # Every select('#someId').<prop> without a null guard must reference an id defined in index.html or JS templates.
+            direct_select_ids = set(re.findall(r"select\('#([A-Za-z0-9_-]+)'\)\.", source))
+            missing_ids = direct_select_ids - defined_ids
+            self.assertEqual(missing_ids, set(),
+                             f'{js_path.name} dereferences select(#id) not defined anywhere: {missing_ids}')
+            # Every select('#someId').<prop> without a null guard must reference an id defined in index.html or JS templates.
+            direct_select_ids = set(re.findall(r"select\('#([A-Za-z0-9_-]+)'\)\.", source))
+            missing_ids = direct_select_ids - defined_ids
+            self.assertEqual(missing_ids, set(),
+                             f'{js_path.name} dereferences select(#id) not defined anywhere: {missing_ids}')
             if node_binary:
                 # Use .mjs extension for the syntax check so Node parses ES module import/export syntax.
                 with tempfile.NamedTemporaryFile('w', suffix='.mjs', delete=False, encoding='utf-8') as temp_mjs:

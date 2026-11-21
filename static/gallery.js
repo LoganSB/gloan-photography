@@ -214,8 +214,10 @@ export async function loadImagesInOrder(galleryElement) {
  */
 export function render() {
   const tags = tagCounts();
-  select('#sPhotos').textContent = state.photoTotal;
-  select('#sTags').textContent = tags.length;
+  const photosStatEl = select('#sPhotos');
+  const tagsStatEl = select('#sTags');
+  if (photosStatEl) photosStatEl.textContent = state.photoTotal;
+  if (tagsStatEl) tagsStatEl.textContent = tags.length;
 
   const filtersBar = select('#filters');
   filtersBar.innerHTML = '';
