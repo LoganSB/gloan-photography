@@ -53,119 +53,13 @@ export function openLightbox(index) {
  */
 export function closeLightbox() {
   stopSlideshow();
-  closeShareModal();
   slideLoadRunId++;
   select('#lb').classList.remove('open', 'show-edit', 'chromeless');
   select('#sbox').classList.remove('zoom', 'loading');
   select('#lbImg').removeAttribute('src');
   document.body.style.overflow = '';
   if (document.fullscreenElement) document.exitFullscreen();
-  // Remove ?photo=<id> from the browser URL when closing the lightbox so refreshing returns to the gallery.
-  const currentUrl = new URL(window.location.href);
-  if (currentUrl.searchParams.has('photo')) {
-    currentUrl.searchParams.delete('photo');
-    window.history.replaceState({}, '', currentUrl.pathname + currentUrl.search + currentUrl.hash);
-  }
   resumeGalleryImageLoads();
-}
-
-/**
- * Open a deep-linked shared photo (`/?photo=<id>`), prepending it to `state.view` if it is on another page.
- */
-export function openSharedPhoto(photo) {
-  if (!photo || !photo.id) return;
-  let idx = state.view.findIndex(item => item.id === photo.id);
-  if (idx < 0) {
-    state.view = [photo, ...state.view];
-    idx = 0;
-  }
-  openLightbox(idx);
-}
-
-/**
- * Build the canonical shareable URL for `photo`.
- */
-export function photoShareUrl(photo) {
-  const url = new URL('/', window.location.origin);
-  url.searchParams.set('photo', photo.id);
-  return url.toString();
-}
-
-/**
- * Open the share dialog for the currently viewed photo.
- */
-export function openShareModal() {
-  const photo = currentLightboxPhoto();
-  if (!photo) return;
-  const shareUrl = photoShareUrl(photo);
-  select('#shareTitle').textContent = 'Share — ' + (photo.title || 'Untitled');
-  const input = select('#shareUrlInput');
-  input.value = shareUrl;
-  select('#shareModal').classList.add('open');
-  setTimeout(() => input.select(), 20);
-}
-
-/**
- * Close the share dialog.
- */
-export function closeShareModal() {
-  select('#shareModal').classList.remove('open');
-}
-
-/**
- * Copy the active photo's share URL to the clipboard (using Clipboard API with textarea fallback).
- */
-export async function copyShareLink() {
-  const photo = currentLightboxPhoto();
-  if (!photo) return;
-  const url = photoShareUrl(photo);
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(url);
-    } else {
-      const input = select('#shareUrlInput');
-      input.value = url;
-      input.select();
-      document.execCommand('copy');
-    }
-    toast('Link copied to clipboard');
-  } catch (error) {
-    toast('Copy the link from the box above');
-  }
-}
-
-/**
- * Open Facebook's standard web share dialog template for the active photo URL.
- */
-function shareToFacebook() {
-  const photo = currentLightboxPhoto();
-  if (!photo) return;
-  const fbUrl = 'https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(photoShareUrl(photo));
-  window.open(fbUrl, '_blank', 'noopener,noreferrer,width=640,height=520');
-}
-
-/**
- * Share via the native Web Share API (Instagram/Messages/AirDrop on mobile) or fall back to copying the link.
- */
-async function shareNativeOrInstagram() {
-  const photo = currentLightboxPhoto();
-  if (!photo) return;
-  const url = photoShareUrl(photo);
-  if (typeof navigator.share === 'function') {
-    try {
-      await navigator.share({
-        title: photo.title || 'Gloan Photography',
-        text: photo.title || 'Check out this photo on Gloan',
-        url,
-      });
-      closeShareModal();
-      return;
-    } catch (error) {
-      if (error.name === 'AbortError') return;
-    }
-  }
-  await copyShareLink();
-  toast('Link copied — paste into Instagram or any app to share');
 }
 
 /**
@@ -200,14 +94,10 @@ export function showSlide(instant = false) {
   select('#lbTags').querySelectorAll('span').forEach(span => {
     span.onclick = () => {
       closeLightbox();
-      const chosenTag = span.dataset.t;
-      const searchInput = select('#tagSearch');
-      if (searchInput) searchInput.value = chosenTag + ', ';
-      state.activeTags.clear();
-      state.searchQuery = chosenTag;
+      state.activeTags = new Set([span.dataset.t]);
       state.page = 0;
       refresh();
-      scrollTo({ top: 0, behavior: 'smooth' });
+      scrollTo({ top: 300, behavior: 'smooth' });
     };
   });
   select('#eTitle').value = photo.title || '';
@@ -453,14 +343,6 @@ export function initLightboxEvents() {
   select('#prev').onclick = () => goSlide(-1);
   select('#next').onclick = () => goSlide(1);
   select('#closeBtn').onclick = closeLightbox;
-  select('#shareBtn').onclick = openShareModal;
-  select('#shareClose').onclick = closeShareModal;
-  select('#shareCopyBtn').onclick = copyShareLink;
-  select('#shareFbBtn').onclick = shareToFacebook;
-  select('#shareNativeBtn').onclick = shareNativeOrInstagram;
-  select('#shareModal').addEventListener('mousedown', event => {
-    if (event.target.id === 'shareModal') closeShareModal();
-  });
   select('#playBtn').onclick = () => (isPlaying ? stopSlideshow() : playSlideshow());
   select('#fsBtn').onclick = () => (
     document.fullscreenElement ? document.exitFullscreen() : lightboxEl.requestFullscreen?.()

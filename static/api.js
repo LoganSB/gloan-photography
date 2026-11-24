@@ -146,14 +146,6 @@ export const API = {
     return this.call('GET', '/api/photos?' + new URLSearchParams(query));
   },
 
-  getPhoto(photoId) {
-    return this.call('GET', '/api/photos/' + encodeURIComponent(photoId));
-  },
-
-  clearAiTags() {
-    return this.call('DELETE', '/api/aitags');
-  },
-
   session() {
     return this.call('GET', '/api/session');
   },

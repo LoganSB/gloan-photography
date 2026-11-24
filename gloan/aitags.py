@@ -4,14 +4,13 @@ Design goals:
 1. Separate tracking of manual vs. AI tags in `photos.json`:
    - `row['tags']` holds ONLY manual / uploaded tags and is never overwritten or modified by the AI tagger.
    - `row['aiTags']` holds ONLY AI-generated tags (at least `MIN_AI_TAGS = 5` per photo, distinct from `row['tags']`).
-   - Only triggers AI tagging activity for a photo when `photos.json` has fewer than 5 valid AI tags.
-2. Focus on generic classifications, biomes, subject/focus, and visual colors/tones:
-   - Examples: `portrait`, `female_subject`, `landscape`, `forest`, `snow`, `red_rock`, `gray`, `mountains`, `lakes`,
-     `sky`, `water`, `desert`, `macro`, `night`, `sunset`, `winter`, `fog`, `rocks`, `trees`, `warm`, `cool`, `blue`, `green`.
-   - Never guesses geographic locations, cities, states, countries, or park names.
-3. Near-zero or zero cloud cost:
-   - When `GLOAN_GEMINI_API_KEY` (or `GEMINI_API_KEY`) is set, calls Google AI Studio's free-tier lightweight vision
-     model (`gemini-2.5-flash-lite` by default, configurable via `GLOAN_GEMINI_MODEL`).
+   - Only triggers AI tagging activity for a photo when `photos.json` has fewer than 5 AI tags (`len(row['aiTags']) < 5`).
+2. Strong emphasis on landscape location, geography, landform, and biome:
+   - Combines Google Gemini Free Tier (`gemini-2.5-flash-lite` when `GLOAN_GEMINI_API_KEY` or `GEMINI_API_KEY` is set)
+     with a zero-cost local landscape/location visual analyzer (using uploaded tags, title location cues, and Pillow
+     regional pixel-palette analysis) so every photo gets at least 5 location- and landscape-focused AI tags at $0.00
+     or fractions-of-a-cent cloud cost.
+3. Cloud Run & Cloud Storage FUSE cost guards:
    - Reuses existing 480px JPEG thumbnails in `data/thumbs/` (via `thumb_path(row)`) before touching originals in
      `data/photos/` so 30-50 MB files are not streamed over FUSE when a 50 KB thumbnail already exists.
    - Caps Gemini output tokens (`maxOutputTokens: 80`) and per-rescan batch size (`MAX_AI_IMAGES_PER_RUN = 25`).
@@ -52,106 +51,68 @@ MAX_AI_IMAGES_PER_RUN = 25
 GEMINI_DEFAULT_MODEL = 'gemini-2.5-flash-lite'
 GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models'
 
-# Deprecated tags from earlier revisions (generic filler + old location-guessing tags).
-# Excluded from counting toward MIN_AI_TAGS so a manual rescan automatically replaces them with clean
-# classification/biome/color tags.
-LEGACY_DEPRECATED_TAGS = {
-    'photography', 'digital-image', 'visual-study', 'composition', 'still-frame', 'gallery',
-    'jpg-format', 'png-format', 'webp-format', 'gif-format', 'balanced-color', 'muted-tones', 'natural-light',
-    'backcountry-terrain', 'backcountry-landscape', 'wilderness-location', 'scenic-overlook', 'natural-terrain',
-    'outdoor-region', 'mountain-country', 'highland-vista', 'field-location', 'wide-horizon', 'wide-landscape',
-    'vertical-canyon-frame', 'daylight-backcountry', 'open-sky-horizon', 'high-plateau-skyline',
-    'snow-or-mist-plateau', 'high-elevation-overlook', 'desert-southwest', 'canyon-country', 'sandstone-formation',
-    'red-rock-canyon', 'mountain-woodland', 'forested-terrain', 'wilderness-forest', 'alpine-highlands',
-    'waterside-location', 'mountain-stream-or-lake', 'night-sky-location', 'twilight-basin', 'sunlit-highlands',
-    'bryce-canyon', 'utah-southwest', 'colorado-plateau', 'hoodoo-amphitheater', 'paunsaugunt-plateau',
-    'zion-canyon', 'navajo-sandstone-cliffs', 'virgin-river-gorge', 'arches-national-park', 'moab-utah',
-    'entrada-sandstone', 'red-rock-desert', 'canyonlands-utah', 'island-in-the-sky', 'desert-mesa',
-    'utah-landscape', 'american-west', 'tokyo-japan', 'kanto-region', 'east-asia', 'japanese-garden',
-    'waterside-courtyard', 'japan-landscape', 'temple-grounds', 'pacific-island-region', 'intermountain-west',
-    'western-roadside', 'high-desert-horizon', 'subterranean-cavern', 'canyon-grotto', 'karst-limestone',
-    'rock-alcove', 'underground-chamber', 'sedimentary-strata', 'canyon-wall-geology', 'sandstone-bedding',
-    'colorado-plateau-geology', 'backcountry-trail', 'wilderness-ridge', 'mountain-footpath', 'canyon-rim-trail',
-    'canyon-rim-overlook', 'high-plateau-vista', 'mountain-viewpoint', 'scenic-promontory', 'mountain-byway',
-    'high-country-highway', 'backcountry-corridor', 'western-open-road', 'ranchland-border', 'rural-highlands',
-    'western-pasture', 'countryside-boundary', 'alpine-snowfield', 'winter-highlands', 'snow-covered-plateau',
-    'high-elevation-winter', 'winter-backcountry', 'alpine-winter-zone', 'frost-highlands', 'cold-desert-plateau',
-    'high-country-summer', 'summer-wilderness', 'arid-mountain-summer', 'conifer-woodland', 'ponderosa-forest',
-    'subalpine-timberline', 'mountain-forest-slope', 'misty-canyon-rim', 'cloud-inversion-valley',
-    'fog-bound-overlook', 'storm-cloud-plateau', 'overcast-highlands', 'diffused-sky-basin',
-    'western-horizon-dusk', 'desert-twilight-sky', 'sunset-overlook', 'alpine-dawn-ridge',
-    'eastern-horizon-light', 'morning-canyon-rim', 'micro-habitat', 'close-up-field-study', 'natural-surface-detail',
-    'eagle-nebula-m16', 'serpens-constellation', 'deep-space-observatory', 'stellar-nursery',
-    'deep-space-nebula', 'galactic-emission-cloud', 'night-sky-field', 'astrophotography-target',
-    'dark-sky-preserve', 'starfield-region', 'celestial-hemisphere', 'deep-sky-location', 'dark-sky-observatory',
-    'galactic-field', 'riparian-basin', 'waterside-habitat', 'reflective-pond', 'botanical-habitat',
-    'woodland-understory', 'native-flora-zone',
+# Legacy generic filler tags from the first AI tagger revision; stripped if they were previously merged into manual
+# `tags` and excluded from counting toward the 5 location-focused AI tags so a rescan upgrades them automatically.
+LEGACY_FILLER_TAGS = {
+    'photography',
+    'digital-image',
+    'visual-study',
+    'composition',
+    'still-frame',
+    'gallery',
+    'jpg-format',
+    'png-format',
+    'webp-format',
+    'gif-format',
+    'balanced-color',
+    'muted-tones',
+    'natural-light',
 }
 
-# Generic fallback classification tags used only when a tiny/synthetic image still needs tags to reach MIN_AI_TAGS (5).
-CLASSIFICATION_BASELINE_TAGS = (
-    'outdoors',
-    'nature',
-    'scenic',
-    'daylight',
-    'color',
-    'still_life',
-    'subject',
+# Location- and landscape-emphasized baseline tags used to guarantee at least MIN_AI_TAGS (5) per photo at $0.00 cost.
+LOCATION_BASELINE_TAGS = (
+    'backcountry-terrain',
+    'wilderness-location',
+    'scenic-overlook',
+    'natural-terrain',
+    'outdoor-region',
+    'mountain-country',
+    'highland-vista',
+    'field-location',
 )
 
-# Maps generic subject/biome words from a photo's title or uploaded tags to clean classification/biome tags.
-# Contains zero geographic or place names.
-CLASSIFICATION_CUE_MAP: dict[str, tuple[str, ...]] = {
-    'portrait': ('portrait', 'person', 'close_up'),
-    'woman': ('portrait', 'female_subject', 'person'),
-    'female': ('portrait', 'female_subject', 'person'),
-    'girl': ('portrait', 'female_subject', 'person'),
-    'man': ('portrait', 'male_subject', 'person'),
-    'male': ('portrait', 'male_subject', 'person'),
-    'boy': ('portrait', 'male_subject', 'person'),
-    'forest': ('forest', 'trees', 'nature'),
-    'woods': ('forest', 'trees', 'nature'),
-    'pine': ('forest', 'trees', 'evergreen'),
-    'trees': ('forest', 'trees', 'nature'),
-    'snow': ('snow', 'winter', 'white'),
-    'winter': ('winter', 'snow', 'cold'),
-    'frost': ('snow', 'winter', 'ice'),
-    'fog': ('fog', 'clouds', 'gray'),
-    'foggy': ('fog', 'clouds', 'gray'),
-    'mist': ('fog', 'mist', 'gray'),
-    'overcast': ('overcast', 'clouds', 'gray'),
-    'mountain': ('mountains', 'landscape', 'outdoors'),
-    'mountains': ('mountains', 'landscape', 'outdoors'),
-    'ridge': ('mountains', 'landscape', 'outdoors'),
-    'peak': ('mountains', 'landscape', 'outdoors'),
-    'lake': ('lakes', 'water', 'landscape'),
-    'lakes': ('lakes', 'water', 'landscape'),
-    'pond': ('water', 'lakes', 'reflection'),
-    'water': ('water', 'lakes', 'nature'),
-    'river': ('river', 'water', 'nature'),
-    'ocean': ('ocean', 'water', 'coast'),
-    'coast': ('coast', 'ocean', 'water'),
-    'canyon': ('canyon', 'red_rock', 'rocks'),
-    'strata': ('rocks', 'red_rock', 'texture'),
-    'cave': ('cave', 'rocks', 'dark'),
-    'rock': ('rocks', 'red_rock', 'stone'),
-    'desert': ('desert', 'red_rock', 'arid'),
-    'sunset': ('sunset', 'sky', 'warm'),
-    'sunrise': ('sunrise', 'sky', 'warm'),
-    'dusk': ('dusk', 'sky', 'evening'),
-    'dawn': ('dawn', 'sky', 'morning'),
-    'macro': ('macro', 'close_up', 'detail'),
-    'flower': ('flowers', 'macro', 'plants'),
-    'plants': ('plants', 'green', 'nature'),
-    'road': ('road', 'outdoors', 'landscape'),
-    'trail': ('trail', 'outdoors', 'nature'),
-    'hike': ('trail', 'outdoors', 'landscape'),
-    'fence': ('fence', 'outdoors', 'rural'),
-    'stars': ('stars', 'night', 'sky'),
-    'nebula': ('nebula', 'space', 'night'),
-    'astrophotography': ('space', 'stars', 'night'),
-    'm16': ('nebula', 'space', 'stars'),
-    'animated': ('animated', 'digital_art'),
+# Maps location/park/landform cues in a photo's title or uploaded tags to geographic and landscape-location AI tags.
+LOCATION_CUE_MAP: dict[str, tuple[str, ...]] = {
+    'bryce': ('bryce-canyon', 'utah-southwest', 'colorado-plateau', 'hoodoo-amphitheater', 'paunsaugunt-plateau'),
+    'zion': ('zion-canyon', 'utah-southwest', 'colorado-plateau', 'navajo-sandstone-cliffs', 'virgin-river-gorge'),
+    'zions': ('zion-canyon', 'utah-southwest', 'colorado-plateau', 'navajo-sandstone-cliffs', 'desert-southwest'),
+    'arches': ('arches-national-park', 'moab-utah', 'colorado-plateau', 'entrada-sandstone', 'red-rock-desert'),
+    'canyonlands': ('canyonlands-utah', 'colorado-plateau', 'island-in-the-sky', 'desert-mesa', 'canyon-country'),
+    'utah': ('utah-landscape', 'colorado-plateau', 'desert-southwest', 'canyon-country', 'american-west'),
+    'tokyo': ('tokyo-japan', 'kanto-region', 'east-asia', 'japanese-garden', 'waterside-courtyard'),
+    'japan': ('japan-landscape', 'east-asia', 'japanese-garden', 'temple-grounds', 'pacific-island-region'),
+    'maverik': ('american-west', 'intermountain-west', 'western-roadside', 'high-desert-horizon'),
+    'cave': ('subterranean-cavern', 'canyon-grotto', 'karst-limestone', 'rock-alcove', 'underground-chamber'),
+    'strata': ('sedimentary-strata', 'canyon-wall-geology', 'sandstone-bedding', 'colorado-plateau-geology'),
+    'hike': ('backcountry-trail', 'wilderness-ridge', 'mountain-footpath', 'canyon-rim-trail'),
+    'lookout': ('canyon-rim-overlook', 'high-plateau-vista', 'mountain-viewpoint', 'scenic-promontory'),
+    'road': ('mountain-byway', 'high-country-highway', 'backcountry-corridor', 'western-open-road'),
+    'fence': ('ranchland-border', 'rural-highlands', 'western-pasture', 'countryside-boundary'),
+    'snow': ('alpine-snowfield', 'winter-highlands', 'snow-covered-plateau', 'high-elevation-winter'),
+    'winter': ('winter-backcountry', 'alpine-winter-zone', 'frost-highlands', 'cold-desert-plateau'),
+    'summer': ('high-country-summer', 'summer-wilderness', 'arid-mountain-summer'),
+    'forest': ('conifer-woodland', 'ponderosa-forest', 'subalpine-timberline', 'mountain-forest-slope'),
+    'foggy': ('misty-canyon-rim', 'cloud-inversion-valley', 'fog-bound-overlook'),
+    'overcast': ('storm-cloud-plateau', 'overcast-highlands', 'diffused-sky-basin'),
+    'sunset': ('western-horizon-dusk', 'desert-twilight-sky', 'sunset-overlook'),
+    'sunrise': ('alpine-dawn-ridge', 'eastern-horizon-light', 'morning-canyon-rim'),
+    'macro': ('micro-habitat', 'close-up-field-study', 'natural-surface-detail'),
+    'm16': ('eagle-nebula-m16', 'serpens-constellation', 'deep-space-observatory', 'stellar-nursery'),
+    'nebula': ('deep-space-nebula', 'galactic-emission-cloud', 'night-sky-field', 'astrophotography-target'),
+    'stars': ('dark-sky-preserve', 'starfield-region', 'celestial-hemisphere'),
+    'astrophotography': ('deep-sky-location', 'dark-sky-observatory', 'galactic-field'),
+    'water': ('riparian-basin', 'waterside-habitat', 'reflective-pond'),
+    'plants': ('botanical-habitat', 'woodland-understory', 'native-flora-zone'),
 }
 
 STOP_WORDS = {
@@ -161,12 +122,12 @@ STOP_WORDS = {
 
 
 def _valid_ai_tags_list(row: Row) -> list[str]:
-    """Return cleaned `row['aiTags']` excluding deprecated legacy tags and any manual `row['tags']`."""
+    """Return cleaned `row['aiTags']` excluding legacy generic filler tags and any manual `row['tags']`."""
     raw_ai = row.get('aiTags')
     if not isinstance(raw_ai, list):
         return []
     manual_set = set(clean_tags(row.get('tags') or []))
-    return [tag for tag in clean_tags(raw_ai) if tag not in LEGACY_DEPRECATED_TAGS and tag not in manual_set]
+    return [tag for tag in clean_tags(raw_ai) if tag not in LEGACY_FILLER_TAGS and tag not in manual_set]
 
 
 def has_ai_tags(row: Row) -> bool:
@@ -235,11 +196,13 @@ def _prepare_compact_image_bytes(row: Row, raw_bytes: bytes | None = None) -> tu
 def _query_gemini_free_tier_tags(
     image_bytes: bytes,
     mime_type: str,
+    title: str = '',
     manual_tags: list[str] | None = None,
 ) -> list[str]:
-    """Call Google Gemini Flash-Lite (`generateContent`) for 6-8 generic classification, biome, focus, and color tags.
+    """Call Google Gemini Flash-Lite (`generateContent`) for 6-8 location-emphasized landscape tags.
 
-    Explicitly avoids guessing geographic locations or place names.
+    Uses the title and any uploaded/manual tags as context cues so the model prioritizes geographic location,
+    national park/region, landform, and biome while avoiding duplicating the manual tags.
     """
     api_key = gemini_api_key()
     if not api_key or not image_bytes or len(image_bytes) > 4 * 1024 * 1024:
@@ -247,20 +210,20 @@ def _query_gemini_free_tier_tags(
 
     model = gemini_model_name()
     url = f'{GEMINI_API_BASE}/{model}:generateContent?key={api_key}'
-    exclude_hint = (
-        f' Do not repeat these existing manual tags: {", ".join(manual_tags[:10])}.'
-        if manual_tags else ''
-    )
+    context_parts: list[str] = []
+    if title:
+        context_parts.append(f'Title: "{title[:80]}"')
+    if manual_tags:
+        context_parts.append(f'Uploaded manual tags (do not repeat these exact words): {", ".join(manual_tags[:10])}')
+    context_hint = (' Context: ' + '; '.join(context_parts) + '.') if context_parts else ''
 
     prompt = (
-        'You are classifying photographs for a gallery. Return 6 to 8 concise lowercase tags '
-        '(single words or underscore_separated terms) focusing ONLY on generic photo classifications, '
-        'primary subject/focus, biomes, weather, and dominant colors — for example: '
-        'portrait, female_subject, male_subject, landscape, macro, forest, snow, red_rock, gray, '
-        'mountains, lakes, water, desert, canyon, sky, clouds, fog, trees, flowers, sunset, night, '
-        'blue, green, orange, monochrome. '
-        'Do NOT guess specific geographic locations, cities, states, countries, or park names.'
-        f'{exclude_hint} Reply with ONLY a comma-separated list of tags.'
+        'You are tagging a landscape and nature photography gallery. Return 6 to 8 concise lowercase tags '
+        '(single words or hyphenated compounds) with a strong emphasis on the LOCATION and geography of the '
+        'landscape (e.g. specific national park, region, state/country, plateau, canyon, mountain range, desert '
+        'southwest, colorado-plateau, bryce-canyon, zion-canyon, utah, alpine-woodland, pacific-coast), along '
+        f'with landform, biome, weather, and lighting.{context_hint} '
+        'Reply with ONLY a comma-separated list of tags.'
     )
     payload = {
         'contents': [{
@@ -310,18 +273,15 @@ def _parse_header_dimensions(raw_bytes: bytes) -> tuple[int, int] | None:
 
 
 def _analyze_local_visual_tags(row: Row, raw_bytes: bytes | None = None) -> list[str]:
-    """Generate generic classification, biome, subject, and color tags in-process via Pillow pixel regions.
+    """Infer location- and landscape-focused tags in-process from uploaded tags, title cues and Pillow pixel regions.
 
-    Guarantees at least `MIN_AI_TAGS` (5) tags at $0.00 cost, distinct from manual `row['tags']`.
+    Guarantees at least `MIN_AI_TAGS` (5) location/landscape AI tags at $0.00 cost, distinct from `row['tags']`.
     """
     manual_tags = clean_tags(row.get('tags') or [])
     manual_set = set(manual_tags)
     tags: list[str] = []
 
-    if str(row.get('ext', '')).lower() == 'gif':
-        tags.append('animated')
-
-    # 1. Map generic biome/subject cues from manual tags and title tokens (no geographic/location names).
+    # 1. Infer geographic region, park, landform and biome from uploaded manual tags and title tokens.
     title = str(row.get('title', ''))
     title_tokens = [
         word.lower() for word in re.findall(r'[A-Za-z0-9]{2,24}', title)
@@ -334,11 +294,16 @@ def _analyze_local_visual_tags(row: Row, raw_bytes: bytes | None = None) -> list
                 cue_tokens.append(sub_part)
 
     for cue in cue_tokens:
-        for mapped_tag in CLASSIFICATION_CUE_MAP.get(cue, ()):
+        for mapped_tag in LOCATION_CUE_MAP.get(cue, ()):
             if mapped_tag not in manual_set and mapped_tag not in tags:
                 tags.append(mapped_tag)
 
-    # 2. Pixel-level biome, composition, and dominant color analysis when Pillow is available.
+    # Include meaningful title location words (if not already in manual_set).
+    for word in title_tokens:
+        if not word.isdigit() and len(word) >= 3 and word not in manual_set and word not in tags:
+            tags.append(word)
+
+    # 2. Regional pixel-palette analysis (top sky band, middle horizon/cliff band, bottom ground/water band).
     source_path: Path | None = thumb_path(row)
     if source_path is None:
         candidate = PHOTO_DIR / f'{row["id"]}.{row["ext"]}'
@@ -352,12 +317,12 @@ def _analyze_local_visual_tags(row: Row, raw_bytes: bytes | None = None) -> list
             if stream_source is not None:
                 with Image.open(stream_source) as img:
                     orig_w, orig_h = img.size
-                    if orig_w > orig_h * 1.15:
-                        tags.append('landscape')
-                    elif orig_h > orig_w * 1.15:
-                        tags.append('portrait')
+                    if orig_w > orig_h * 1.85:
+                        tags.append('panoramic-vista')
+                    elif orig_w >= orig_h:
+                        tags.append('wide-horizon')
                     else:
-                        tags.append('square')
+                        tags.append('vertical-canyon-frame')
 
                     sample = img.convert('RGB').resize((32, 32), Image.Resampling.BILINEAR)
                     raw_rgb = sample.tobytes()
@@ -368,15 +333,11 @@ def _analyze_local_visual_tags(row: Row, raw_bytes: bytes | None = None) -> list
                     total_px = len(pixels) or 1
 
                     lum_sum = 0.0
-                    sat_sum = 0.0
                     red_rock_count = 0
-                    snow_white_count = 0
-                    gray_count = 0
+                    snow_fog_count = 0
                     forest_green_count = 0
                     sky_blue_top = 0
                     water_blue_bottom = 0
-                    warm_count = 0
-                    cool_count = 0
 
                     for idx, (red, green, blue) in enumerate(pixels):
                         lum = (0.299 * red + 0.587 * green + 0.114 * blue) / 255.0
@@ -384,57 +345,46 @@ def _analyze_local_visual_tags(row: Row, raw_bytes: bytes | None = None) -> list
                         max_c = max(red, green, blue)
                         min_c = min(red, green, blue)
                         sat = ((max_c - min_c) / max_c) if max_c > 0 else 0.0
-                        sat_sum += sat
 
+                        # Sandstone / terracotta / red-rock canyon palette (Utah / Desert Southwest)
                         if red > 110 and red > green + 18 and green > blue + 10:
                             red_rock_count += 1
+                        # High-brightness, low-saturation snowfield / fog / rim mist
                         if lum > 0.72 and sat < 0.16:
-                            snow_white_count += 1
-                        elif 0.22 <= lum <= 0.72 and sat < 0.14:
-                            gray_count += 1
+                            snow_fog_count += 1
+                        # Conifer / woodland foliage green
                         if green > 55 and green >= red - 5 and green > blue + 12:
                             forest_green_count += 1
+                        # Blue sky in upper third vs water in lower two-thirds
                         if blue > red + 18 and blue >= green - 10:
                             if idx < total_px // 3 and lum > 0.32:
                                 sky_blue_top += 1
                             elif idx >= total_px // 3:
                                 water_blue_bottom += 1
-                        if red > blue + 22:
-                            warm_count += 1
-                        elif blue > red + 18:
-                            cool_count += 1
 
                     mean_lum = lum_sum / total_px
-                    mean_sat = sat_sum / total_px
 
                     if red_rock_count > total_px * 0.14:
-                        tags.extend(['red_rock', 'rocks', 'orange'])
+                        tags.extend(['red-rock-canyon', 'desert-southwest', 'sandstone-formation', 'canyon-country'])
                     if forest_green_count > total_px * 0.14:
-                        tags.extend(['forest', 'trees', 'green'])
-                    if snow_white_count > total_px * 0.22:
-                        tags.extend(['snow', 'white'])
-                    if gray_count > total_px * 0.28:
-                        tags.extend(['gray', 'overcast'])
+                        tags.extend(['mountain-woodland', 'forested-terrain', 'wilderness-forest'])
+                    if snow_fog_count > total_px * 0.22:
+                        tags.extend(['alpine-highlands', 'snow-or-mist-plateau', 'high-elevation-overlook'])
                     if sky_blue_top > total_px * 0.10:
-                        tags.extend(['sky', 'blue'])
+                        tags.extend(['open-sky-horizon', 'high-plateau-skyline'])
                     if water_blue_bottom > total_px * 0.12:
-                        tags.extend(['water', 'lakes', 'blue'])
+                        tags.extend(['waterside-location', 'mountain-stream-or-lake'])
 
                     if mean_lum < 0.22:
-                        tags.extend(['night', 'dark'])
-                    elif mean_lum > 0.74:
-                        tags.append('bright')
-
-                    if mean_sat < 0.08:
-                        tags.extend(['monochrome', 'gray'])
-                    elif warm_count > cool_count * 1.35 and warm_count > total_px * 0.2:
-                        tags.append('warm')
-                    elif cool_count > warm_count * 1.35 and cool_count > total_px * 0.2:
-                        tags.append('cool')
+                        tags.extend(['night-sky-location', 'twilight-basin'])
+                    elif mean_lum > 0.72:
+                        tags.append('sunlit-highlands')
+                    else:
+                        tags.append('daylight-backcountry')
         except Exception:  # noqa: BLE001
             pass
 
-    # 3. Header fallback when Pillow is not installed on host.
+    # 3. Header/format fallback when Pillow is not installed on host.
     if len(tags) < MIN_AI_TAGS:
         header_bytes = raw_bytes or b''
         if not header_bytes and source_path is not None:
@@ -446,18 +396,13 @@ def _analyze_local_visual_tags(row: Row, raw_bytes: bytes | None = None) -> list
         dims = _parse_header_dimensions(header_bytes)
         if dims:
             width, height = dims
-            if width > height * 1.15:
-                tags.append('landscape')
-            elif height > width * 1.15:
-                tags.append('portrait')
-            else:
-                tags.append('square')
+            tags.append('wide-horizon' if width >= height else 'vertical-canyon-frame')
 
-    # Filter out duplicates of manual `row['tags']` and deprecated legacy tags.
-    filtered = [tag for tag in clean_tags(tags) if tag not in manual_set and tag not in LEGACY_DEPRECATED_TAGS]
+    # Filter out any tags that duplicate manual `row['tags']` or legacy filler tags.
+    filtered = [tag for tag in clean_tags(tags) if tag not in manual_set and tag not in LEGACY_FILLER_TAGS]
 
-    # 4. Top up from CLASSIFICATION_BASELINE_TAGS so every image gets >= MIN_AI_TAGS (5) distinct AI tags.
-    for baseline_tag in CLASSIFICATION_BASELINE_TAGS:
+    # 4. Top up from LOCATION_BASELINE_TAGS so every image is guaranteed >= MIN_AI_TAGS (5) distinct AI tags.
+    for baseline_tag in LOCATION_BASELINE_TAGS:
         if len(filtered) >= MIN_AI_TAGS:
             break
         if baseline_tag not in manual_set and baseline_tag not in filtered:
@@ -467,7 +412,7 @@ def _analyze_local_visual_tags(row: Row, raw_bytes: bytes | None = None) -> list
 
 
 def generate_ai_tags_for_row(row: Row, raw_bytes: bytes | None = None) -> list[str]:
-    """Generate at least `MIN_AI_TAGS` (5) classification/biome/focus AI tags for `row`, distinct from `row['tags']`."""
+    """Generate at least `MIN_AI_TAGS` (5) location-focused AI tags for `row`, distinct from manual `row['tags']`."""
     manual_tags = clean_tags(row.get('tags') or [])
     manual_set = set(manual_tags)
     existing_ai = _valid_ai_tags_list(row)
@@ -476,15 +421,16 @@ def generate_ai_tags_for_row(row: Row, raw_bytes: bytes | None = None) -> list[s
     gemini_tags = _query_gemini_free_tier_tags(
         compact_bytes,
         mime_type,
+        title=str(row.get('title', '')),
         manual_tags=manual_tags,
     )
     local_tags = _analyze_local_visual_tags(row, raw_bytes if raw_bytes is not None else compact_bytes)
 
     combined = [
         tag for tag in clean_tags([*existing_ai, *gemini_tags, *local_tags])
-        if tag not in manual_set and tag not in LEGACY_DEPRECATED_TAGS
+        if tag not in manual_set and tag not in LEGACY_FILLER_TAGS
     ]
-    for baseline_tag in CLASSIFICATION_BASELINE_TAGS:
+    for baseline_tag in LOCATION_BASELINE_TAGS:
         if len(combined) >= MIN_AI_TAGS:
             break
         if baseline_tag not in manual_set and baseline_tag not in combined:
@@ -494,6 +440,7 @@ def generate_ai_tags_for_row(row: Row, raw_bytes: bytes | None = None) -> list[s
 
 def apply_ai_tags_to_row(row: Row, raw_bytes: bytes | None = None) -> list[str]:
     """Populate `row['aiTags']` with >= 5 AI tags if `len(row['aiTags']) < 5`, leaving `row['tags']` untouched."""
+    # Ensure manual `row['tags']` is cleaned but never mixed with AI tags.
     row['tags'] = clean_tags(row.get('tags') or [])
     if has_ai_tags(row):
         row['aiTags'] = _valid_ai_tags_list(row)
@@ -504,9 +451,9 @@ def apply_ai_tags_to_row(row: Row, raw_bytes: bytes | None = None) -> list[str]:
 
 
 def tag_untagged_photos(max_images: int = MAX_AI_IMAGES_PER_RUN) -> int:
-    """Populate `row['aiTags']` (at least 5 tags) for any indexed photo whose `aiTags` in `photos.json` has < 5 valid tags.
+    """Populate `row['aiTags']` (at least 5 tags) for any indexed photo whose `aiTags` in `photos.json` has < 5 tags.
 
-    Also strips any deprecated legacy tags that were merged into `row['tags']` by earlier revisions so `row['tags']`
+    Also strips any legacy filler tags that were merged into `row['tags']` by the initial revision so `row['tags']`
     contains strictly manual/uploaded tags and `row['aiTags']` is tracked separately.
     """
     with INDEX_LOCK:
@@ -515,9 +462,10 @@ def tag_untagged_photos(max_images: int = MAX_AI_IMAGES_PER_RUN) -> int:
         for row in all_rows:
             prev_ai_set = set(row.get('aiTags') or [])
             if prev_ai_set and isinstance(row.get('tags'), list):
+                # Remove only tags that were in `aiTags` AND in `LEGACY_FILLER_TAGS` (or auto-appended at the tail).
                 pure_manual = [
                     tag for tag in row['tags']
-                    if not (tag in prev_ai_set and tag in LEGACY_DEPRECATED_TAGS)
+                    if not (tag in prev_ai_set and tag in LEGACY_FILLER_TAGS)
                 ]
                 if pure_manual != row['tags']:
                     row['tags'] = pure_manual
@@ -552,20 +500,3 @@ def tag_untagged_photos(max_images: int = MAX_AI_IMAGES_PER_RUN) -> int:
         if newly_tagged:
             save_index(rows)
     return newly_tagged
-
-
-def clear_all_ai_tags() -> int:
-    """Remove `aiTags` from every row in `photos.json` while leaving manual `tags` untouched.
-
-    Returns the number of photos that had AI tags cleared.
-    """
-    with INDEX_LOCK:
-        rows = load_index()
-        cleared = 0
-        for row in rows:
-            if row.get('aiTags'):
-                row['aiTags'] = []
-                cleared += 1
-        if cleared:
-            save_index(rows)
-    return cleared
