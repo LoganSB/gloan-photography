@@ -1,23 +1,14 @@
 """Photo index (photos.json) and image-file handling: validation, cleaning, scanning, persistence and caching."""
 
-import io
 import json
 import os
 import re
 import secrets
-import struct
 import threading
 from pathlib import Path
 from typing import Any
 
 from gloan.config import INDEX_FILE, MAX_STORY, PHOTO_DIR, THUMB_DIR, THUMB_FILE_RE
-
-try:
-    from PIL import Image, ImageOps
-    Image.MAX_IMAGE_PIXELS = 60_000_000
-    _HAS_PILLOW = True
-except ImportError:
-    _HAS_PILLOW = False
 
 
 INDEX_LOCK = threading.Lock()  # guards photos.json read-modify-write across handler threads
@@ -45,85 +36,6 @@ def sniff_ext(data: bytes) -> str | None:
     elif data[:6] in (b'GIF87a', b'GIF89a'):
         result = 'gif'
     return result
-
-
-def _parse_dimensions_from_bytes(raw_bytes: bytes) -> tuple[int, int] | None:
-    """Fast header-only (width, height) parser for PNG, GIF, JPEG and WebP when Pillow is unavailable."""
-    if len(raw_bytes) >= 24 and raw_bytes.startswith(b'\x89PNG\r\n\x1a\n'):
-        width, height = struct.unpack('>II', raw_bytes[16:24])
-        return (width, height) if width > 0 and height > 0 else None
-    if len(raw_bytes) >= 10 and raw_bytes[:6] in (b'GIF87a', b'GIF89a'):
-        width, height = struct.unpack('<HH', raw_bytes[6:10])
-        return (width, height) if width > 0 and height > 0 else None
-    if len(raw_bytes) >= 30 and raw_bytes[:4] == b'RIFF' and raw_bytes[8:12] == b'WEBP':
-        chunk = raw_bytes[12:16]
-        if chunk == b'VP8X':
-            width = 1 + int.from_bytes(raw_bytes[24:27], 'little')
-            height = 1 + int.from_bytes(raw_bytes[27:30], 'little')
-            return (width, height) if width > 0 and height > 0 else None
-        if chunk == b'VP8 ' and raw_bytes[23:26] == b'\x9d\x01\x2a':
-            width = struct.unpack('<H', raw_bytes[26:28])[0] & 0x3FFF
-            height = struct.unpack('<H', raw_bytes[28:30])[0] & 0x3FFF
-            return (width, height) if width > 0 and height > 0 else None
-        if chunk == b'VP8L' and raw_bytes[20] == 0x2F:
-            bits = int.from_bytes(raw_bytes[21:25], 'little')
-            width = (bits & 0x3FFF) + 1
-            height = ((bits >> 14) & 0x3FFF) + 1
-            return (width, height) if width > 0 and height > 0 else None
-    if raw_bytes.startswith(b'\xff\xd8'):
-        offset = 2
-        length = len(raw_bytes)
-        while offset + 9 < length:
-            if raw_bytes[offset] != 0xFF:
-                break
-            marker = raw_bytes[offset + 1]
-            while marker == 0xFF and offset + 2 < length:
-                offset += 1
-                marker = raw_bytes[offset + 1]
-            if marker in (0xD8, 0xD9, 0x01) or 0xD0 <= marker <= 0xD7:
-                offset += 2
-                continue
-            if offset + 4 > length:
-                break
-            seg_len = struct.unpack('>H', raw_bytes[offset + 2:offset + 4])[0]
-            if seg_len < 2:
-                break
-            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
-                if offset + 9 <= length:
-                    height, width = struct.unpack('>HH', raw_bytes[offset + 5:offset + 9])
-                    return (width, height) if width > 0 and height > 0 else None
-                break
-            offset += 2 + seg_len
-    return None
-
-
-def compute_aspect_ratio(source: Path | bytes) -> float | None:
-    """Compute display `width / height` rounded to 4 decimals (honouring EXIF orientation when Pillow is installed)."""
-    if _HAS_PILLOW:
-        try:
-            stream: Any = io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source
-            with Image.open(stream) as img:
-                width, height = img.size
-                # Swap dimensions if EXIF Orientation tag (274) rotates 90/270 degrees (values 5, 6, 7, 8).
-                exif = img.getexif()
-                if exif and exif.get(274) in (5, 6, 7, 8):
-                    width, height = height, width
-                if width > 0 and height > 0:
-                    return round(width / height, 4)
-        except Exception:  # noqa: BLE001
-            pass
-    try:
-        if isinstance(source, (bytes, bytearray)):
-            header = bytes(source[:65536])
-        else:
-            with source.open('rb') as handle:
-                header = handle.read(65536)
-        dims = _parse_dimensions_from_bytes(header)
-        if dims and dims[1] > 0:
-            return round(dims[0] / dims[1], 4)
-    except OSError:
-        pass
-    return None
 
 
 def clean_title(raw: object) -> str:
@@ -269,22 +181,10 @@ def scan_folder(skipped: list[str] | None = None) -> int:
         Number of photos adopted.
     """
     adopted = 0
-    updated_meta = False
     skipped = [] if skipped is None else skipped
     with INDEX_LOCK:
         rows = load_index()
         known = {f'{r["id"]}.{r["ext"]}' for r in rows}
-        # Backfill missing aspectRatio metadata in photos.json for existing photos (reusing thumbnails when present).
-        for existing_row in rows:
-            if not existing_row.get('aspectRatio'):
-                thumb_file = THUMB_DIR / f'{existing_row["id"]}.jpg'
-                photo_file = PHOTO_DIR / f'{existing_row["id"]}.{existing_row["ext"]}'
-                source_file = thumb_file if thumb_file.is_file() else (photo_file if photo_file.is_file() else None)
-                if source_file is not None:
-                    ratio = compute_aspect_ratio(source_file)
-                    if ratio:
-                        existing_row['aspectRatio'] = ratio
-                        updated_meta = True
         for path in sorted(PHOTO_DIR.iterdir()):
             if path.name in known or path.name.startswith('.'):
                 continue
@@ -299,15 +199,10 @@ def scan_folder(skipped: list[str] | None = None) -> int:
                 pid = 'p' + secrets.token_hex(8)
                 added = int(path.stat().st_mtime * 1000)  # keep the file's own date for ordering
                 title = clean_title(re.sub(r'[_-]+', ' ', path.stem))
-                dest = PHOTO_DIR / f'{pid}.{ext}'
-                path.rename(dest)
-                ratio = compute_aspect_ratio(dest)
-                new_row: Row = {'id': pid, 'ext': ext, 'title': title, 'tags': [], 'story': '', 'added': added}
-                if ratio:
-                    new_row['aspectRatio'] = ratio
-                rows.append(new_row)
+                path.rename(PHOTO_DIR / f'{pid}.{ext}')
+                rows.append({'id': pid, 'ext': ext, 'title': title, 'tags': [], 'story': '', 'added': added})
                 adopted += 1
-        if adopted or updated_meta:
+        if adopted:
             save_index(rows)
     return adopted
 
@@ -357,19 +252,15 @@ def all_row_tags(row: Row) -> list[str]:
 
 
 def public_row(row: Row) -> Row:
-    """Row as the API exposes it, keeping manual `tags` and AI `aiTags` tracked separately with `aspectRatio`."""
+    """Row as the API exposes it, keeping manual `tags` and AI `aiTags` tracked separately."""
     thumb = thumb_path(row)
     manual_tags = clean_tags(row.get('tags') or [])
     ai_tags = clean_tags(row.get('aiTags') or [])
-    ratio = row.get('aspectRatio')
-    if not isinstance(ratio, (int, float)) or ratio <= 0:
-        ratio = compute_aspect_ratio(thumb) if thumb is not None else compute_aspect_ratio(PHOTO_DIR / f'{row["id"]}.{row["ext"]}')
     return {
         'story': '',
         **row,
         'tags': manual_tags,
         'aiTags': ai_tags,
-        'aspectRatio': round(float(ratio), 4) if ratio else 1.3333,
         'url': f'/photos/{row["id"]}.{row["ext"]}',
         'thumbUrl': f'/thumbs/{thumb.name}' if thumb else None,
         'size': file_size(row),

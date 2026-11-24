@@ -1,6 +1,5 @@
 """Flask HTTP application and routes for the site, static assets, photo files and JSON API."""
 
-import html
 import ipaddress
 import json
 import secrets
@@ -11,7 +10,7 @@ from urllib.parse import parse_qs, unquote
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 from werkzeug.exceptions import HTTPException
 
-from gloan.aitags import apply_ai_tags_to_row, clear_all_ai_tags, tag_untagged_photos
+from gloan.aitags import apply_ai_tags_to_row, tag_untagged_photos
 from gloan.auth import (
     Auth,
     FAILS,
@@ -50,7 +49,6 @@ from gloan.storage import (
     clean_story,
     clean_tags,
     clean_title,
-    compute_aspect_ratio,
     get_rows_cache,
     load_index,
     public_row,
@@ -187,29 +185,7 @@ def handle_exception(error: Exception) -> Response:
 @app.get('/')
 @app.get('/index.html')
 def serve_index() -> Response:
-    """Serve the single-page gallery shell, injecting Open Graph meta tags when `?photo=<id>` is shared."""
-    shared_id = (request.args.get('photo') or '').strip()
-    if shared_id and ID_RE.match(shared_id):
-        row = next((item for item in get_rows_cache().rows if item['id'] == shared_id), None)
-        if row:
-            pub = public_row(row)
-            origin = request.url_root.rstrip('/')
-            share_url = f'{origin}/?photo={shared_id}'
-            image_url = f'{origin}{pub["thumbUrl"] or pub["url"]}'
-            title = pub.get('title') or 'Gloan Photography'
-            description = (pub.get('story') or 'Landscape & Macro Photography on Gloan')[:200]
-            og_tags = (
-                f'<meta property="og:type" content="website">\n'
-                f'<meta property="og:title" content="{html.escape(title, quote=True)}">\n'
-                f'<meta property="og:description" content="{html.escape(description, quote=True)}">\n'
-                f'<meta property="og:image" content="{html.escape(image_url, quote=True)}">\n'
-                f'<meta property="og:url" content="{html.escape(share_url, quote=True)}">\n'
-                f'<meta name="twitter:card" content="summary_large_image">\n'
-            )
-            page_html = (ROOT / 'index.html').read_text(encoding='utf-8').replace('</head>', og_tags + '</head>', 1)
-            response = Response(page_html, mimetype='text/html; charset=utf-8')
-            response.headers['Cache-Control'] = 'no-cache'
-            return response
+    """Serve the single-page gallery shell."""
     response = send_file(ROOT / 'index.html', mimetype='text/html; charset=utf-8', conditional=True)
     response.headers['Cache-Control'] = 'no-cache'
     return response
@@ -327,28 +303,6 @@ def api_rescan() -> Response:
     indexed_count = len(load_index())
     LOGGER.info('Scan: added %d, aiTagged %d, skipped %s, indexed %d', added, ai_tagged, skipped, indexed_count)
     return jsonify({'added': added, 'aiTagged': ai_tagged, 'skipped': skipped[:10], 'indexed': indexed_count})
-
-
-@app.delete('/api/aitags')
-def api_clear_ai_tags() -> Response:
-    """Clear all AI-generated `aiTags` from `photos.json` while preserving manual `tags` (owner only)."""
-    auth_error = require_owner()
-    if auth_error:
-        return auth_error
-    cleared = clear_all_ai_tags()
-    LOGGER.info('Cleared AI tags from %d photo(s)', cleared)
-    return jsonify({'cleared': cleared})
-
-
-@app.get('/api/photos/<photo_id>')
-def api_get_photo(photo_id: str) -> Response:
-    """Return metadata for a single photo by ID so shared `?photo=<id>` URLs can open directly in the lightbox."""
-    if not ID_RE.match(photo_id):
-        return fail(404, 'no such photo')
-    row = next((item for item in get_rows_cache().rows if item['id'] == photo_id), None)
-    if not row:
-        return fail(404, 'no such photo')
-    return jsonify(public_row(row))
 
 
 def _check_rate_limit(requester_ip: str) -> Response | None:
@@ -495,7 +449,6 @@ def api_upload_photo() -> Response:
     if not ext:
         return fail(415, 'not a supported image (jpeg/png/webp/gif)')
     photo_id = 'p' + secrets.token_hex(8)
-    aspect_ratio = compute_aspect_ratio(data)
     row: Row = {
         'id': photo_id,
         'ext': ext,
@@ -504,8 +457,6 @@ def api_upload_photo() -> Response:
         'story': '',
         'added': int(time.time() * 1000),
     }
-    if aspect_ratio:
-        row['aspectRatio'] = aspect_ratio
     PHOTO_DIR.mkdir(parents=True, exist_ok=True)
     (PHOTO_DIR / f'{photo_id}.{ext}').write_bytes(data)
     apply_ai_tags_to_row(row, raw_bytes=data)

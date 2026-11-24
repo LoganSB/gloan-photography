@@ -24,18 +24,12 @@
   <button class="btn icon" id="themeBtn" title="Toggle theme">◐</button>
 </div></header>
 
-<main class="wrap gallery-layout">
-  <aside class="tag-sidebar" id="tagSidebar" aria-label="Filter by tag">
-    <div class="sidebar-title">Tags</div>
-    <ul class="tag-list" id="tagList"></ul>
-  </aside>
-  <section class="gallery-main">
-    <div class="filters" id="filters"></div>
-    <div id="galleryHost"></div>
-  </section>
+<main class="wrap">
+  <div class="filters" id="filters"></div>
+  <div id="galleryHost"></div>
 </main>
 
-<footer><div class="wrap"><div>© Gloan</div><div class="owner-only footer-links" id="scanWrap"><a id="scanBtn">Scan folder for new photos</a><a id="thumbBtn">Generate thumbnails</a><a id="clearAiTagsBtn">Clear AI tags</a><a id="passkeyRegBtn">Register Passkey</a></div></div></footer>
+<footer><div class="wrap"><div>© Gloan</div><div class="owner-only footer-links" id="scanWrap"><a id="scanBtn">Scan folder for new photos</a><a id="thumbBtn">Generate thumbnails</a><a id="passkeyRegBtn">Register Passkey</a></div></div></footer>
 
 <!-- upload modal -->
 <div class="modal" id="upModal"><div class="panel">
@@ -54,15 +48,13 @@
 </div></div>
 <input type="file" id="file" accept="image/*" multiple hidden>
 
-<!-- Admin login & Passkey registration (WebAuthn Passkey + Cloudflare Turnstile CAPTCHA) -->
+<!-- Admin login (WebAuthn Passkey + Cloudflare Turnstile CAPTCHA) -->
 <div class="modal" id="loginModal"><div class="panel" style="width:min(400px,100%)">
-  <header><h2 id="loginModalTitle">Admin login</h2><button class="btn icon" id="loginClose">✕</button></header>
+  <header><h2>Admin login</h2><button class="btn icon" id="loginClose">✕</button></header>
   <div class="body">
     <div id="turnstileBox" style="display:none;justify-content:center;min-height:65px"></div>
-    <button class="btn primary" id="passkeyLoginBtn" style="width:100%;justify-content:center">Sign in with QR code</button>
-    <button class="btn" id="passkeyLoginAltBtn" style="width:100%;justify-content:center">Sign in through a different method</button>
-    <button class="btn primary" id="passkeySetupBtn" style="display:none;width:100%;justify-content:center">Register Passkey with QR code</button>
-    <button class="btn" id="passkeySetupAltBtn" style="display:none;width:100%;justify-content:center">Register a passkey through a different method</button>
+    <button class="btn primary" id="passkeyLoginBtn" style="width:100%;justify-content:center">Sign in with Passkey</button>
+    <button class="btn primary" id="passkeySetupBtn" style="display:none;width:100%;justify-content:center">Register owner Passkey</button>
     <div class="hint" id="loginErr"></div>
   </div>
 </div></div>
@@ -77,25 +69,10 @@
   <footer><button class="btn primary" id="tagGo">Add tags</button></footer>
 </div></div>
 
-<!-- share photo modal (above the lightbox, which is z-index 80) -->
-<div class="modal" id="shareModal" style="z-index:90"><div class="panel" style="width:min(440px,100%)">
-  <header><h2 id="shareTitle">Share photo</h2><button class="btn icon" id="shareClose">✕</button></header>
-  <div class="body">
-    <input class="field" id="shareUrlInput" type="text" readonly aria-label="Shareable photo URL">
-    <div class="share-actions">
-      <button class="btn primary" id="shareCopyBtn">Copy link</button>
-      <button class="btn" id="shareFbBtn">Facebook</button>
-      <button class="btn" id="shareNativeBtn">Instagram / Share</button>
-    </div>
-    <div class="hint" id="shareHint">Anyone with this link can view this photo directly. On mobile, Instagram / Share opens your device share sheet.</div>
-  </div>
-</div></div>
-
 <!-- lightbox -->
 <div class="lb" id="lb">
   <div class="lb-top">
     <span class="cnt" id="lbCnt"></span>
-    <button class="btn" id="shareBtn" title="Share" aria-label="Share"><svg class="share-ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg><span class="lbl">Share</span></button>
     <button class="btn" id="storyBtn" style="display:none" title="Story (S)"><span class="lbl">Story</span></button>
     <button class="btn owner-only" id="addTagBtn" title="Add tags">+ tags</button>
     <button class="btn owner-only" id="editBtn" title="Edit (E)"><span class="lbl">Edit</span></button>

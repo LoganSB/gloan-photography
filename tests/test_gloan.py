@@ -193,38 +193,6 @@ class FrontendSyntaxTest(unittest.TestCase):
         self.assertIn('Loading image…', gallery_source)
         self.assertIn("match: 'all'", gallery_source)
         self.assertIn('TILE_LOAD_CONCURRENCY', gallery_source)
-        self.assertIn('PAGE_SIZES = [16, 32, 64, 128]', gallery_source)
-        self.assertIn('id="tagSidebar"', html_text)
-        self.assertIn('id="tagList"', html_text)
-        self.assertIn('id="passkeyLoginAltBtn"', html_text)
-        self.assertIn('id="passkeySetupAltBtn"', html_text)
-        app_source = (static_dir / 'app.js').read_text(encoding='utf-8')
-        self.assertIn("hints = ['hybrid']", app_source)
-        self.assertIn("transports: ['hybrid']", app_source)
-
-        # Validate static/masonry_templates.json: 4-8 slots per template, exact non-overlapping 12x6 coverage,
-        # and at least one template supporting 3 stacked portrait images.
-        tpl_data = json.loads((static_dir / 'masonry_templates.json').read_text(encoding='utf-8'))
-        cols, rows = tpl_data['cols'], tpl_data['rows']
-        self.assertEqual((cols, rows), (12, 6))
-        has_three_stacked_portraits = False
-        for tpl in tpl_data['templates']:
-            self.assertTrue(4 <= tpl['count'] <= 8, tpl['id'])
-            self.assertEqual(len(tpl['slots']), tpl['count'], tpl['id'])
-            occupied: set[tuple[int, int]] = set()
-            by_col_band: dict[tuple[int, int], int] = {}
-            for slot in tpl['slots']:
-                for c in range(slot['col'], slot['col'] + slot['colSpan']):
-                    for r in range(slot['row'], slot['row'] + slot['rowSpan']):
-                        self.assertTrue(1 <= c <= cols and 1 <= r <= rows, f'Out of bounds in {tpl["id"]}')
-                        self.assertNotIn((c, r), occupied, f'Overlap at {(c, r)} in {tpl["id"]}')
-                        occupied.add((c, r))
-                key = (slot['col'], slot['colSpan'])
-                by_col_band[key] = by_col_band.get(key, 0) + 1
-                if by_col_band[key] >= 3 and slot['colSpan'] <= 4:
-                    has_three_stacked_portraits = True
-            self.assertEqual(len(occupied), cols * rows, f'Gaps detected in template {tpl["id"]}')
-        self.assertTrue(has_three_stacked_portraits, 'Expected at least one template with 3 stacked portrait slots')
         lightbox_source = (static_dir / 'lightbox.js').read_text(encoding='utf-8')
         self.assertIn("classList.add('loading')", lightbox_source)
         self.assertIn('pauseGalleryImageLoads()', lightbox_source)
@@ -584,11 +552,6 @@ class ServerAndApiTest(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(row.get('tags'), ['landscape', 'lake'])
         self.assertGreaterEqual(len(row.get('aiTags', [])), 5)
-        self.assertGreater(row.get('aspectRatio', 0), 0)
-        # Verify Grid view page sizes up to 128 are accepted by GET /api/photos.
-        st128, page128 = self.api_call('/api/photos?size=128')
-        self.assertEqual(st128, 200)
-        self.assertEqual(page128['size'], 128)
         status, reply = self.api_call('/api/tags?q=landscpe')
         self.assertEqual(status, 200)
         self.assertEqual(reply['suggestions'][0], {'tag': 'landscape', 'count': 1, 'match': 'fuzzy'})
@@ -694,16 +657,15 @@ class ServerAndApiTest(unittest.TestCase):
         self.assertEqual(scan_reply2['added'], 0)
         self.assertEqual(scan_reply2['aiTagged'], 0)
 
-        # Existing photos in photos.json with < 5 valid aiTags (or deprecated location tags) trigger AI tagging
-        # on manual admin rescan while preserving manual tags separately.
+        # Existing photos in photos.json with < 5 aiTags trigger AI tagging on manual admin rescan while preserving manual tags.
         (PHOTO_DIR / 'p2222222222222222.jpg').write_bytes(TINY_JPEG)
         rows = load_index()
         rows.append({
             'id': 'p2222222222222222',
             'ext': 'jpg',
-            'title': 'Snowy Forest Canyon',
+            'title': 'Bryce Sunset Canyon Trail',
             'tags': ['utah', 'manual-tag'],
-            'aiTags': ['partial-ai-tag', 'bryce-canyon', 'colorado-plateau'],
+            'aiTags': ['partial-ai-tag'],
             'story': '',
             'added': 1700000000000,
         })
@@ -716,34 +678,13 @@ class ServerAndApiTest(unittest.TestCase):
         self.assertEqual(untagged_now['tags'], ['utah', 'manual-tag'])
         self.assertGreaterEqual(len(untagged_now.get('aiTags', [])), 5)
         self.assertIn('partial-ai-tag', untagged_now['aiTags'])
-        self.assertIn('forest', untagged_now['aiTags'])
-        self.assertIn('red_rock', untagged_now['aiTags'])
-        self.assertNotIn('bryce-canyon', untagged_now['aiTags'])
-        self.assertNotIn('colorado-plateau', untagged_now['aiTags'])
+        self.assertIn('bryce-canyon', untagged_now['aiTags'])
+        self.assertIn('colorado-plateau', untagged_now['aiTags'])
         # Both manual tags and aiTags are searchable via /api/photos?q= and /api/photos?tags=.
         _, by_manual = self.api_call('/api/photos?tags=manual-tag')
         self.assertEqual([p['id'] for p in by_manual['photos']], ['p2222222222222222'])
-        _, by_ai = self.api_call('/api/photos?tags=red_rock')
+        _, by_ai = self.api_call('/api/photos?tags=bryce-canyon')
         self.assertEqual([p['id'] for p in by_ai['photos']], ['p2222222222222222'])
-
-        # Public single-photo endpoint and Open Graph share tags for `/?photo=<id>` work without login.
-        get_status, single_photo = self.api_call('/api/photos/p2222222222222222')
-        self.assertEqual(get_status, 200)
-        self.assertEqual(single_photo['id'], 'p2222222222222222')
-        self.assertEqual(self.api_call('/api/photos/p0000000000000000')[0], 404)
-        og_status, og_html = self.api_call('/?photo=p2222222222222222')
-        self.assertEqual(og_status, 200)
-        self.assertIn(b'property="og:title" content="Snowy Forest Canyon"', og_html)
-        self.assertIn(b'property="og:url"', og_html)
-
-        # DELETE /api/aitags requires owner auth, clears all aiTags, and preserves manual tags untouched.
-        self.assertEqual(self.api_call('/api/aitags', 'DELETE')[0], 401)
-        clear_status, clear_reply = self.api_call('/api/aitags', 'DELETE', headers={'Authorization': f'Bearer {token}'})
-        self.assertEqual(clear_status, 200)
-        self.assertEqual(clear_reply['cleared'], 2)
-        after_clear = next(item for item in load_index() if item['id'] == 'p2222222222222222')
-        self.assertEqual(after_clear['tags'], ['utah', 'manual-tag'])
-        self.assertEqual(after_clear.get('aiTags', []), [])
 
     def test_passkey_webauthn_multi_device_and_turnstile(self) -> None:
         """Verify multi-device WebAuthn Passkey enrollment (phone + desktop + laptop), assertion login, and Turnstile CAPTCHA."""
