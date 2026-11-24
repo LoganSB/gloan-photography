@@ -3,15 +3,17 @@
  */
 
 import { API, isOwner, registerOwnerRenderCallback, select, setOwner, toast, withBusy } from './api.js';
-import { fetchPage, registerGalleryActions, render, rescanFolder, runThumbnailJob, state } from './gallery.js';
+import { clearAiTags, fetchPage, registerGalleryActions, render, rescanFolder, runThumbnailJob, state } from './gallery.js';
 import {
   closeLightbox,
+  closeShareModal,
   closeTagModal,
   currentLightboxPhoto,
   goSlide,
   initLightboxEvents,
   isSlideshowPlaying,
   openLightbox,
+  openSharedPhoto,
   openTagModal,
   playSlideshow,
   saveEdit,
@@ -95,13 +97,23 @@ function ensureTurnstileWidget() {
 }
 
 /**
- * Open the Admin login modal, showing Sign in with Passkey (or first-time Register Passkey) and Cloudflare Turnstile.
+ * Open the Admin login / Passkey registration modal.
+ * Both login and registration default to the QR code (hybrid phone passkey) method, with a secondary button
+ * to open all other authenticator options (Windows Hello, Touch ID, security key, browser manager).
  */
-function openLogin() {
+function openLogin(mode = 'auto') {
+  const isRegisterMode = mode === 'register' || !hasRegisteredPasskey;
   select('#loginErr').textContent = '';
-  select('#passkeyLoginBtn').style.display = hasRegisteredPasskey ? 'inline-flex' : 'none';
-  select('#passkeySetupBtn').style.display = hasRegisteredPasskey ? 'none' : 'inline-flex';
-  ensureTurnstileWidget();
+  select('#loginModalTitle').textContent = isRegisterMode ? 'Register Passkey' : 'Admin login';
+  select('#passkeyLoginBtn').style.display = isRegisterMode ? 'none' : 'inline-flex';
+  select('#passkeyLoginAltBtn').style.display = isRegisterMode ? 'none' : 'inline-flex';
+  select('#passkeySetupBtn').style.display = isRegisterMode ? 'inline-flex' : 'none';
+  select('#passkeySetupAltBtn').style.display = isRegisterMode ? 'inline-flex' : 'none';
+  if (isRegisterMode && isOwner()) {
+    select('#turnstileBox').style.display = 'none';
+  } else {
+    ensureTurnstileWidget();
+  }
   select('#loginModal').classList.add('open');
 }
 
@@ -113,11 +125,17 @@ function closeLogin() {
 }
 
 /**
- * Register a new WebAuthn Passkey (ES256 / P-256) using the browser's authenticator and save it on the server.
+ * Register a new WebAuthn Passkey (ES256 / P-256) and save it on the server.
+ * When `preferQr` is true (default), hints the browser to open the phone QR code (hybrid / cross-platform) prompt
+ * directly; when false, omits attachment/hints so all local and cross-platform methods are presented.
  */
-async function registerPasskey(triggerButton) {
+async function registerPasskey(triggerButton, { preferQr = true } = {}) {
   select('#loginErr').textContent = '';
-  await withBusy(triggerButton, 'Waiting for Passkey…', async () => {
+  if (!isOwner() && turnstileSiteKey && !turnstileToken) {
+    select('#loginErr').textContent = 'Please complete the CAPTCHA verification first.';
+    return;
+  }
+  await withBusy(triggerButton, preferQr ? 'Opening QR code…' : 'Waiting for Passkey…', async () => {
     try {
       if (!window.PublicKeyCredential) {
         throw new Error('Passkeys (WebAuthn) are not supported in this browser');
@@ -127,21 +145,25 @@ async function registerPasskey(triggerButton) {
         id: base64UrlToBytes(item.id),
         type: item.type,
       }));
-      const credential = await navigator.credentials.create({
-        publicKey: {
-          challenge: base64UrlToBytes(options.challenge),
-          rp: options.rp,
-          user: {
-            id: new TextEncoder().encode(options.user.id),
-            name: options.user.name,
-            displayName: options.user.displayName,
-          },
-          pubKeyCredParams: [{ alg: -7, type: 'public-key' }], // ES256 (ECDSA P-256)
-          excludeCredentials,
-          authenticatorSelection: { userVerification: 'preferred' },
-          timeout: 60000,
+      const publicKeyOptions = {
+        challenge: base64UrlToBytes(options.challenge),
+        rp: options.rp,
+        user: {
+          id: new TextEncoder().encode(options.user.id),
+          name: options.user.name,
+          displayName: options.user.displayName,
         },
-      });
+        pubKeyCredParams: [{ alg: -7, type: 'public-key' }], // ES256 (ECDSA P-256)
+        excludeCredentials,
+        authenticatorSelection: preferQr
+          ? { authenticatorAttachment: 'cross-platform', userVerification: 'preferred' }
+          : { userVerification: 'preferred' },
+        timeout: 60000,
+      };
+      if (preferQr) {
+        publicKeyOptions.hints = ['hybrid'];
+      }
+      const credential = await navigator.credentials.create({ publicKey: publicKeyOptions });
       const response = credential.response;
       if (typeof response.getPublicKey !== 'function' || typeof response.getPublicKeyAlgorithm !== 'function') {
         throw new Error('Browser does not support WebAuthn getPublicKey()');
@@ -151,6 +173,7 @@ async function registerPasskey(triggerButton) {
         publicKey: bufferToBase64Url(response.getPublicKey()),
         clientDataJSON: bufferToBase64Url(response.clientDataJSON),
         authenticatorData: bufferToBase64Url(response.getAuthenticatorData()),
+        captchaToken: turnstileToken,
       });
       hasRegisteredPasskey = true;
       if (reply.token) {
@@ -167,29 +190,34 @@ async function registerPasskey(triggerButton) {
 }
 
 /**
- * Sign in as owner using the registered WebAuthn Passkey and Cloudflare Turnstile token (if enabled).
+ * Sign in as owner using a registered WebAuthn Passkey and Cloudflare Turnstile token (if enabled).
+ * When `preferQr` is true (default), sets `hints: ['hybrid']` and `transports: ['hybrid']` so the browser opens
+ * the QR code prompt directly; when false, omits hints/transports so other methods (Windows Hello, Touch ID, etc.) appear.
  */
-async function doPasskeyLogin() {
+async function doPasskeyLogin(triggerButton, { preferQr = true } = {}) {
   select('#loginErr').textContent = '';
   if (turnstileSiteKey && !turnstileToken) {
     select('#loginErr').textContent = 'Please complete the CAPTCHA verification first.';
     return;
   }
-  await withBusy(select('#passkeyLoginBtn'), 'Verifying Passkey…', async () => {
+  await withBusy(triggerButton, preferQr ? 'Opening QR code…' : 'Verifying Passkey…', async () => {
     try {
       const options = await API.passkeyLoginOptions();
-      const assertion = await navigator.credentials.get({
-        publicKey: {
-          challenge: base64UrlToBytes(options.challenge),
-          rpId: options.rpId,
-          allowCredentials: options.allowCredentials.map(item => ({
-            id: base64UrlToBytes(item.id),
-            type: item.type,
-          })),
-          userVerification: 'preferred',
-          timeout: 60000,
-        },
-      });
+      const publicKeyOptions = {
+        challenge: base64UrlToBytes(options.challenge),
+        rpId: options.rpId,
+        allowCredentials: options.allowCredentials.map(item => (
+          preferQr
+            ? { id: base64UrlToBytes(item.id), type: item.type, transports: ['hybrid'] }
+            : { id: base64UrlToBytes(item.id), type: item.type }
+        )),
+        userVerification: 'preferred',
+        timeout: 60000,
+      };
+      if (preferQr) {
+        publicKeyOptions.hints = ['hybrid'];
+      }
+      const assertion = await navigator.credentials.get({ publicKey: publicKeyOptions });
       const response = assertion.response;
       const reply = await API.passkeyLogin({
         credentialId: bufferToBase64Url(assertion.rawId),
@@ -230,6 +258,22 @@ async function load() {
     return;
   }
   render();
+
+  // If the visitor arrived via a shared photo URL (`/?photo=<id>`), open that photo directly in the lightbox.
+  const sharedPhotoId = new URLSearchParams(window.location.search).get('photo');
+  if (sharedPhotoId && /^p[0-9a-f]{16}$/.test(sharedPhotoId)) {
+    const existingIndex = state.view.findIndex(item => item.id === sharedPhotoId);
+    if (existingIndex >= 0) {
+      openLightbox(existingIndex);
+    } else {
+      try {
+        const sharedPhoto = await API.getPhoto(sharedPhotoId);
+        openSharedPhoto(sharedPhoto);
+      } catch (error) {
+        toast('Shared photo not found');
+      }
+    }
+  }
 }
 
 // Theme toggle
@@ -249,9 +293,11 @@ select('#authBtn').onclick = () => {
     openLogin();
   }
 };
-select('#passkeyLoginBtn').onclick = doPasskeyLogin;
-select('#passkeySetupBtn').onclick = () => registerPasskey(select('#passkeySetupBtn'));
-select('#passkeyRegBtn').onclick = () => registerPasskey(select('#passkeyRegBtn'));
+select('#passkeyLoginBtn').onclick = () => doPasskeyLogin(select('#passkeyLoginBtn'), { preferQr: true });
+select('#passkeyLoginAltBtn').onclick = () => doPasskeyLogin(select('#passkeyLoginAltBtn'), { preferQr: false });
+select('#passkeySetupBtn').onclick = () => registerPasskey(select('#passkeySetupBtn'), { preferQr: true });
+select('#passkeySetupAltBtn').onclick = () => registerPasskey(select('#passkeySetupAltBtn'), { preferQr: false });
+select('#passkeyRegBtn').onclick = () => openLogin('register');
 select('#loginClose').onclick = closeLogin;
 select('#loginModal').addEventListener('mousedown', event => {
   if (event.target.id === 'loginModal') closeLogin();
@@ -260,9 +306,14 @@ select('#loginModal').addEventListener('mousedown', event => {
 // Footer owner tools
 select('#thumbBtn').onclick = runThumbnailJob;
 select('#scanBtn').onclick = rescanFolder;
+select('#clearAiTagsBtn').onclick = clearAiTags;
 
 // Global keyboard shortcuts for modals and the lightbox
 document.addEventListener('keydown', event => {
+  if (select('#shareModal').classList.contains('open')) {
+    if (event.key === 'Escape') closeShareModal();
+    return;
+  }
   if (event.target.id === 'tagInput') {
     if (event.key === 'Enter') submitTags();
     else if (event.key === 'Escape') closeTagModal();

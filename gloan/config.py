@@ -35,10 +35,10 @@ MAX_STORY = 5000
 MAX_UPLOAD = 25 * 1024 * 1024
 
 
-DEFAULT_PAGE_SIZE = 10
+DEFAULT_PAGE_SIZE = 16
 
 
-MAX_PAGE_SIZE = 100  # caps one response so a client cannot ask for the whole gallery at once
+MAX_PAGE_SIZE = 128  # supports grid view multiples of 16 (16/32/64/128) while bounding one response
 
 
 MAX_FILTER_TAGS = 30

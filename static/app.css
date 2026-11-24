@@ -22,6 +22,8 @@ header.top{position:sticky;top:0;z-index:20;backdrop-filter:blur(16px);backgroun
 .brand span{color:var(--muted);font-weight:400}
 .spacer{flex:1}
 .btn{padding:9px 16px;border-radius:999px;background:var(--bg3);border:1px solid var(--line);font-size:13.5px;transition:.2s;display:inline-flex;gap:8px;align-items:center}
+.btn svg.share-ico{display:block;flex:none}
+.share-actions{display:flex;gap:8px;flex-wrap:wrap}
 .btn:hover{background:var(--line)}
 .btn.primary{background:var(--accent);color:var(--accent-ink);border-color:transparent}
 .btn.primary:hover{opacity:.88}
@@ -52,8 +54,19 @@ header.top{position:sticky;top:0;z-index:20;backdrop-filter:blur(16px);backgroun
 .stats{display:flex;gap:28px;margin-top:26px;color:var(--muted);font-size:13px}
 .stats b{display:block;color:var(--text);font-size:22px;font-weight:600}
 
+/* left tag list sidebar + main gallery column */
+.gallery-layout{display:grid;grid-template-columns:210px minmax(0,1fr);gap:24px;align-items:start;padding-top:14px}
+.tag-sidebar{position:sticky;top:78px;max-height:calc(100vh - 100px);overflow-y:auto;padding-right:6px}
+.sidebar-title{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:600;padding:4px 10px 8px}
+.tag-list{list-style:none;padding:0;display:flex;flex-direction:column;gap:2px}
+.tag-list li button{width:100%;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;border-radius:8px;font-size:13px;color:var(--muted);text-align:left;transition:.15s}
+.tag-list li button:hover{background:var(--bg2);color:var(--text)}
+.tag-list li button.on{background:var(--accent);color:var(--accent-ink);font-weight:500}
+.tag-list li button small{opacity:.65;font-size:11.5px;flex:none}
+.gallery-main{min-width:0}
+
 /* filters */
-.filters{padding:14px 0 22px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.filters{padding:0 0 16px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 /* tag search + autocomplete list in header */
 .search{position:relative;flex:1;max-width:420px;min-width:140px}
 .search .field{border-radius:999px;padding:7px 14px;font-size:13.5px}
@@ -74,7 +87,10 @@ header.top{position:sticky;top:0;z-index:20;backdrop-filter:blur(16px);backgroun
 
 /* gallery */
 .gallery{columns:4 280px;column-gap:16px;padding-bottom:80px}
-.gallery.uniform{columns:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}
+.gallery.masonry-mosaic{columns:auto;display:grid;grid-template-columns:repeat(12,minmax(0,1fr));grid-template-rows:repeat(6,minmax(0,1fr));gap:12px;width:100%;max-height:calc(100vh - 148px);padding-bottom:0;margin-bottom:28px}
+.gallery.masonry-mosaic .card{margin:0;width:100%;height:100%;min-height:0}
+.gallery.masonry-mosaic .card img{width:100%;height:100%;object-fit:cover}
+.gallery.uniform{columns:auto;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}
 .gallery.uniform .card{aspect-ratio:4/3;margin:0}
 .gallery.uniform .card img{height:100%;object-fit:cover}
 .card{break-inside:avoid;margin:0 0 16px;position:relative;border-radius:var(--radius);overflow:hidden;background:var(--bg2);cursor:zoom-in;
@@ -176,4 +192,5 @@ footer{border-top:1px solid var(--line);padding:26px 0;color:var(--muted);font-s
 @media(max-width:760px){.story{left:12px;right:12px;top:auto;bottom:150px;width:auto;max-height:42%}.lb.story-open .stagebox{padding-right:0}}
 .toast{position:fixed;bottom:24px;left:50%;transform:translate(-50%,20px);background:var(--accent);color:var(--accent-ink);padding:10px 18px;border-radius:99px;opacity:0;transition:.3s;z-index:200;font-size:13.5px;pointer-events:none}
 .toast.show{opacity:1;transform:translate(-50%,0)}
+@media(max-width:860px){.gallery-layout{grid-template-columns:1fr;gap:14px}.tag-sidebar{position:static;max-height:170px;border-bottom:1px solid var(--line);padding-bottom:10px}.gallery.uniform{grid-template-columns:repeat(2,minmax(0,1fr))}.gallery.masonry-mosaic{max-height:none;aspect-ratio:auto!important;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:auto}.gallery.masonry-mosaic .card{grid-column:auto!important;grid-row:auto!important;aspect-ratio:4/3}}
 @media(max-width:640px){.wrap{padding:0 16px}#slideBtn span.lbl{display:none}.hero{padding-top:44px}.mode{margin-left:0;width:100%}.nav{display:none}.stagebox{padding:8px 12px}}

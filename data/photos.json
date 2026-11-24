@@ -54,7 +54,8 @@
   ],
   "story": "",
   "added": 1741237047388,
-  "thumb": "p7ea7ecdee625ffef.jpg"
+  "thumb": "p7ea7ecdee625ffef.jpg",
+  "aspectRatio": 1.3296
  },
  {
   "id": "pa3b89db21a5ce416",
@@ -63,7 +64,8 @@
   "tags": [],
   "story": "",
   "added": 1794813051305,
-  "thumb": "pa3b89db21a5ce416.jpg"
+  "thumb": "pa3b89db21a5ce416.jpg",
+  "aspectRatio": 0.6667
  },
  {
   "id": "pdb38c53551d10da7",
@@ -77,7 +79,8 @@
   ],
   "story": "",
   "added": 1794813065503,
-  "thumb": "pdb38c53551d10da7.jpg"
+  "thumb": "pdb38c53551d10da7.jpg",
+  "aspectRatio": 1.5094
  },
  {
   "id": "pea12cce19888dc0e",
@@ -91,7 +94,8 @@
   ],
   "story": "",
   "added": 1741236205735,
-  "thumb": "pea12cce19888dc0e.jpg"
+  "thumb": "pea12cce19888dc0e.jpg",
+  "aspectRatio": 1.3296
  },
  {
   "id": "pfc945de54440c573",
@@ -100,7 +104,8 @@
   "tags": [],
   "story": "",
   "added": 1696536997000,
-  "thumb": "pfc945de54440c573.jpg"
+  "thumb": "pfc945de54440c573.jpg",
+  "aspectRatio": 1.3296
  },
  {
   "id": "p8e4d8460d3483425",
@@ -109,7 +114,8 @@
   "tags": [],
   "story": "",
   "added": 1696537716000,
-  "thumb": "p8e4d8460d3483425.jpg"
+  "thumb": "p8e4d8460d3483425.jpg",
+  "aspectRatio": 1.3296
  },
  {
   "id": "p63cfdf1b3bc0b8c1",
@@ -118,7 +124,8 @@
   "tags": [],
   "story": "",
   "added": 1696686624000,
-  "thumb": "p63cfdf1b3bc0b8c1.jpg"
+  "thumb": "p63cfdf1b3bc0b8c1.jpg",
+  "aspectRatio": 1.3296
  },
  {
   "id": "p874d8e4d58098a25",
@@ -132,7 +139,8 @@
   ],
   "story": "",
   "added": 1794813064989,
-  "thumb": "p874d8e4d58098a25.jpg"
+  "thumb": "p874d8e4d58098a25.jpg",
+  "aspectRatio": 1.4953
  },
  {
   "id": "pbcb5482b9adaafea",
@@ -141,7 +149,8 @@
   "tags": [],
   "story": "",
   "added": 1794813064423,
-  "thumb": "pbcb5482b9adaafea.jpg"
+  "thumb": "pbcb5482b9adaafea.jpg",
+  "aspectRatio": 1.5
  },
  {
   "id": "pac6d9724b9963c7e",
@@ -155,7 +164,8 @@
   ],
   "story": "",
   "added": 1794813065423,
-  "thumb": "pac6d9724b9963c7e.jpg"
+  "thumb": "pac6d9724b9963c7e.jpg",
+  "aspectRatio": 1.5
  },
  {
   "id": "pb1c7f07357460328",
@@ -164,6 +174,7 @@
   "tags": [],
   "story": "",
   "added": 1794813050615,
-  "thumb": "pb1c7f07357460328.jpg"
+  "thumb": "pb1c7f07357460328.jpg",
+  "aspectRatio": 1.5
  }
 ]
