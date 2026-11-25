@@ -2,7 +2,7 @@
  * Gallery state, server-side pagination/sorting/filtering, sequential image loading and thumbnail/rescan jobs.
  */
 
-import { API, createElement, escapeHtml, isOwner, parseTags, select, toast, withBusy } from './api.js';
+import { API, createElement, escapeHtml, isOwner, parseTags, runBackgroundTask, select, toast, withBusy } from './api.js';
 
 // Sort keys must match SORT_KEYS in gloan/query.py; labels are for the dropdown only.
 export const SORTS = {
@@ -151,6 +151,7 @@ let imageLoadRun = 0;  // bumped on every render or lightbox open so tile downlo
 const activeTileImages = new Set(); // all tile <img> elements currently downloading, so openLightbox can abort them
 let currentGalleryEl = null;
 let refreshRun = 0;    // bumped per fetch so a slow, outdated response cannot overwrite a newer one
+let activeFetchController = null; // cancels superseded GET /api/photos calls on rapid filter/page clicks
 
 /**
  * Abort any in-flight gallery tile downloads so a lightbox full-resolution image request never waits in the
@@ -234,6 +235,12 @@ if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
  */
 export async function fetchPage() {
   const runId = ++refreshRun;
+  if (activeFetchController) {
+    activeFetchController.abort();
+    activeFetchController = null;
+  }
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  activeFetchController = controller;
   const isMasonry = effectiveLayout() === 'masonry';
   const query = {
     page: isMasonry ? 0 : state.page,
@@ -243,10 +250,16 @@ export async function fetchPage() {
     tags: [...state.activeTags].join(','),
     q: state.searchQuery,
   };
-  const [reply, masonryConfig] = await Promise.all([
-    API.list(query),
-    isMasonry ? loadMasonryTemplates() : Promise.resolve(null),
-  ]);
+  let reply;
+  let masonryConfig;
+  try {
+    [reply, masonryConfig] = await Promise.all([
+      API.list(query, controller?.signal),
+      isMasonry ? loadMasonryTemplates() : Promise.resolve(null),
+    ]);
+  } finally {
+    if (runId === refreshRun) activeFetchController = null;
+  }
   if (runId !== refreshRun) return false; // a newer request superseded this one
 
   const removedTags = [...state.activeTags].filter(tag => !reply.tags.some(([name]) => name === tag));
@@ -278,17 +291,18 @@ export async function fetchPage() {
 
 /**
  * Fetch the current page from the server and redraw the gallery.
- * Shows an immediate loading state on `#galleryHost` so filter/sort/page clicks respond without delay.
+ * When `silent` is true (background sync after optimistic UI updates), avoids flashing the loading badge.
  */
-export async function refresh() {
+export async function refresh({ silent = false } = {}) {
   const host = select('#galleryHost');
-  if (host) host.classList.add('loading');
+  if (host && !silent) host.classList.add('loading');
   try {
     if (await fetchPage()) render();
   } catch (error) {
+    if (error && error.name === 'AbortError') return; // superseded by a newer click
     toast(error.message);
   } finally {
-    if (host) host.classList.remove('loading');
+    if (host && !silent && !activeFetchController) host.classList.remove('loading');
   }
 }
 
@@ -426,6 +440,17 @@ function toggleTagInSearch(tagName) {
   state.searchQuery = terms.join(', ');
   state.activeTags.clear();
   state.page = 0;
+  // Optimistically highlight active sidebar tags at 0ms while GET /api/photos fetches in the background.
+  const nextInUse = new Set(terms.map(term => term.toLowerCase()));
+  const sidebarButtons = select('#tagList')?.querySelectorAll('button') || [];
+  sidebarButtons.forEach((btn, idx) => {
+    if (idx === 0) {
+      btn.classList.toggle('on', nextInUse.size === 0);
+    } else {
+      const label = (btn.querySelector('span')?.textContent || '').toLowerCase();
+      btn.classList.toggle('on', nextInUse.has(label));
+    }
+  });
   refresh();
 }
 
@@ -505,6 +530,7 @@ export function render() {
       state.layout = button.dataset.l;
       localStorage.setItem('gloan-layout', state.layout);
       state.page = 0;
+      modeBar.querySelectorAll('[data-l]').forEach(btn => btn.classList.toggle('on', btn === button));
       refresh();
     };
   });
@@ -601,29 +627,31 @@ export function suggestionChips(container, inputElement) {
  */
 export async function runThumbnailJob() {
   await withBusy(select('#thumbBtn'), 'Generating thumbnails…', async () => {
-    try {
+    await runBackgroundTask('Generating thumbnails…', async () => {
       try {
-        await API.call('POST', '/api/thumbnails');
-      } catch (error) {
-        if (!/already running/.test(error.message)) throw error; // joining an in-progress run is fine
-      }
-      toast('Generating thumbnails…');
-      for (;;) {
-        await new Promise(done => setTimeout(done, 1500));
-        const status = await API.call('GET', '/api/thumbnails');
-        if (status.running) continue;
-        await refresh();
-        if (status.exitCode === 0) {
-          toast(status.missing ? `${status.missing} photo(s) still have no thumbnail` : 'Thumbnails up to date');
-        } else {
-          const lastLine = status.output.trim().split('\n').pop() || 'unknown error';
-          toast('Thumbnail tool failed: ' + lastLine);
+        try {
+          await API.call('POST', '/api/thumbnails');
+        } catch (error) {
+          if (!/already running/.test(error.message)) throw error; // joining an in-progress run is fine
         }
-        return;
+        toast('Generating thumbnails in background…');
+        for (;;) {
+          await new Promise(done => setTimeout(done, 1500));
+          const status = await API.call('GET', '/api/thumbnails');
+          if (status.running) continue;
+          await refresh({ silent: true });
+          if (status.exitCode === 0) {
+            toast(status.missing ? `${status.missing} photo(s) still have no thumbnail` : 'Thumbnails up to date');
+          } else {
+            const lastLine = status.output.trim().split('\n').pop() || 'unknown error';
+            toast('Thumbnail tool failed: ' + lastLine);
+          }
+          return;
+        }
+      } catch (error) {
+        toast(error.message);
       }
-    } catch (error) {
-      toast(error.message);
-    }
+    });
   });
 }
 
@@ -632,22 +660,30 @@ export async function runThumbnailJob() {
  */
 export async function rescanFolder() {
   await withBusy(select('#scanBtn'), 'Scanning folder…', async () => {
-    try {
-      const result = await API.call('POST', '/api/rescan');
-      state.page = 0;
-      await refresh();
-      const aiNote = result.aiTagged ? `, AI tagged ${result.aiTagged}` : '';
-      if (result.added) {
-        toast(`Added ${result.added} photo${result.added > 1 ? 's' : ''} from the folder${aiNote}`);
-      } else if (result.aiTagged) {
-        toast(`AI tagged ${result.aiTagged} photo${result.aiTagged > 1 ? 's' : ''}`);
-      } else {
-        const skippedText = result.skipped.length ? '; skipped: ' + result.skipped.join(', ') : '';
-        toast(`No new photos found (${result.indexed} already listed${skippedText})`);
+    await runBackgroundTask('Scanning folder…', async () => {
+      try {
+        const result = await API.call('POST', '/api/rescan');
+        state.page = 0;
+        await refresh({ silent: true });
+        const aiNote = result.aiTagged ? `, AI tagged ${result.aiTagged}` : '';
+        if (result.added) {
+          toast(`Added ${result.added} photo${result.added > 1 ? 's' : ''} from the folder${aiNote}`);
+        } else if (result.aiTagged) {
+          toast(`AI tagged ${result.aiTagged} photo${result.aiTagged > 1 ? 's' : ''}`);
+        } else {
+          const skippedCount = Array.isArray(result.skipped) ? result.skipped.length : 0;
+          let skippedNote = '';
+          if (skippedCount === 1) {
+            skippedNote = ` (${result.skipped[0]})`;
+          } else if (skippedCount > 1) {
+            skippedNote = ` (${skippedCount} skipped, e.g. ${result.skipped[0]})`;
+          }
+          toast(`No new photos found — ${result.indexed} indexed${skippedNote}`);
+        }
+      } catch (error) {
+        toast(error.message);
       }
-    } catch (error) {
-      toast(error.message);
-    }
+    });
   });
 }
 
@@ -657,14 +693,16 @@ export async function rescanFolder() {
 export async function clearAiTags() {
   if (!confirm('Clear all AI-generated tags from photos.json? Manual tags will be kept.')) return;
   await withBusy(select('#clearAiTagsBtn'), 'Clearing AI tags…', async () => {
-    try {
-      const result = await API.clearAiTags();
-      await refresh();
-      toast(result.cleared
-        ? `Cleared AI tags from ${result.cleared} photo${result.cleared > 1 ? 's' : ''}`
-        : 'No AI tags to clear');
-    } catch (error) {
-      toast(error.message);
-    }
+    await runBackgroundTask('Clearing AI tags…', async () => {
+      try {
+        const result = await API.clearAiTags();
+        await refresh({ silent: true });
+        toast(result.cleared
+          ? `Cleared AI tags from ${result.cleared} photo${result.cleared > 1 ? 's' : ''}`
+          : 'No AI tags to clear');
+      } catch (error) {
+        toast(error.message);
+      }
+    });
   });
 }

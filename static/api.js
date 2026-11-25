@@ -68,14 +68,63 @@ export function parseTags(commaSeparated) {
 let toastTimerId = null;
 
 /**
- * Show a temporary status message pill at the bottom of the screen.
+ * Show a temporary status message at the bottom of the screen (capped at 5.5s, tap/click to dismiss early).
  */
 export function toast(message) {
   const toastEl = select('#toast');
-  toastEl.textContent = message;
+  if (!toastEl) return;
+  const text = String(message || '').trim();
+  toastEl.textContent = text;
   toastEl.classList.add('show');
+  toastEl.title = 'Tap to dismiss';
+  toastEl.onclick = () => {
+    clearTimeout(toastTimerId);
+    toastEl.classList.remove('show');
+  };
   clearTimeout(toastTimerId);
-  toastTimerId = setTimeout(() => toastEl.classList.remove('show'), 2200 + message.length * 50);
+  const durationMs = Math.min(5500, Math.max(2400, 2200 + text.length * 25));
+  toastTimerId = setTimeout(() => toastEl.classList.remove('show'), durationMs);
+}
+
+const activeBackgroundTasks = new Map();
+let nextBackgroundTaskId = 1;
+
+/**
+ * Sync the non-blocking `#bgStatus` pill to show the most recent active background task (if any).
+ */
+function renderBackgroundStatus() {
+  const pill = select('#bgStatus');
+  const labelEl = select('#bgStatusText');
+  if (!pill || !labelEl) return;
+  if (!activeBackgroundTasks.size) {
+    pill.classList.remove('show');
+    return;
+  }
+  const labels = [...activeBackgroundTasks.values()];
+  const suffix = labels.length > 1 ? ` (+${labels.length - 1})` : '';
+  labelEl.textContent = labels[labels.length - 1] + suffix;
+  pill.classList.add('show');
+}
+
+/**
+ * Run an asynchronous background task while displaying a non-blocking status pill so the UI updates immediately
+ * and stays interactive. Passes an `updateLabel(newText)` helper into `taskFn`.
+ */
+export function runBackgroundTask(initialLabel, taskFn) {
+  const taskId = nextBackgroundTaskId++;
+  activeBackgroundTasks.set(taskId, initialLabel);
+  renderBackgroundStatus();
+  const updateLabel = nextLabel => {
+    if (!activeBackgroundTasks.has(taskId)) return;
+    activeBackgroundTasks.set(taskId, nextLabel);
+    renderBackgroundStatus();
+  };
+  return Promise.resolve()
+    .then(() => taskFn(updateLabel))
+    .finally(() => {
+      activeBackgroundTasks.delete(taskId);
+      renderBackgroundStatus();
+    });
 }
 
 /**
@@ -220,17 +269,20 @@ export const API = {
 
   /**
    * Perform a JSON or binary request against the server and unwrap errors cleanly.
+   * Supports optional `signal` (AbortSignal) to cancel superseded requests without error noise.
    */
-  async call(method, path, { body, headers } = {}) {
+  async call(method, path, { body, headers, signal, csrfTokenOverride } = {}) {
     const requestHeaders = { ...headers };
-    if (this.csrfToken && (method === 'POST' || method === 'PATCH' || method === 'DELETE')) {
-      requestHeaders['X-CSRF-Token'] = this.csrfToken;
+    const effectiveCsrf = csrfTokenOverride !== undefined ? csrfTokenOverride : this.csrfToken;
+    if (effectiveCsrf && (method === 'POST' || method === 'PATCH' || method === 'DELETE')) {
+      requestHeaders['X-CSRF-Token'] = effectiveCsrf;
     }
     const response = await fetch(path, {
       method,
       headers: requestHeaders,
       body,
       credentials: 'same-origin',
+      signal,
     });
     const payload = await response.json().catch(() => ({}));
     if (response.status === 401 && isOwner() && !path.startsWith('/api/passkey/')) {
@@ -242,12 +294,12 @@ export const API = {
     return payload;
   },
 
-  logout() {
-    return this.call('POST', '/api/logout');
+  logout(csrfTokenOverride) {
+    return this.call('POST', '/api/logout', { csrfTokenOverride });
   },
 
-  list(query) {
-    return this.call('GET', '/api/photos?' + new URLSearchParams(query));
+  list(query, signal) {
+    return this.call('GET', '/api/photos?' + new URLSearchParams(query), { signal });
   },
 
   getPhoto(photoId) {
@@ -262,8 +314,8 @@ export const API = {
     return this.call('GET', '/api/session');
   },
 
-  tags(query, limit = 8) {
-    return this.call('GET', '/api/tags?' + new URLSearchParams({ q: query, limit }));
+  tags(query, limit = 8, signal) {
+    return this.call('GET', '/api/tags?' + new URLSearchParams({ q: query, limit }), { signal });
   },
 
   passkeyRegisterOptions() {

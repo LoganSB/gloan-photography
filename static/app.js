@@ -313,18 +313,15 @@ select('#themeBtn').onclick = () => {
   localStorage.setItem('gloan-theme', nextTheme);
 };
 
-// Admin login & logout controls
-select('#authBtn').onclick = async () => {
+// Admin login & logout controls (optimistic 0ms logout; cookie cleared asynchronously in background)
+select('#authBtn').onclick = () => {
   if (isOwner()) {
-    try {
-      await API.logout();
-    } catch (error) {
-      // Clear local owner UI state even if the network call fails.
-    }
+    const previousCsrf = API.csrfToken;
     API.setCsrfToken('');
     setOwner(false);
     updatePendingTagsBadge(0);
     toast('Logged out');
+    API.logout(previousCsrf).catch(() => {});
   } else {
     openLogin();
   }

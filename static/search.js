@@ -47,6 +47,7 @@ export function attachTagAutocomplete({
   let highlightedIndex = -1;
   let searchTimerId = null;
   let searchRunId = 0;
+  let activeLookupController = null;
 
   const close = () => {
     listEl.classList.remove('open');
@@ -77,12 +78,19 @@ export function attachTagAutocomplete({
   const update = async () => {
     const { completedTerms, activeSegment } = splitCommaInput(inputEl.value);
     const runId = ++searchRunId;
+    if (activeLookupController) {
+      activeLookupController.abort();
+      activeLookupController = null;
+    }
     let found = state.suggestionCache.get(activeSegment);
     if (!found) {
+      activeLookupController = typeof AbortController === 'function' ? new AbortController() : null;
       try {
-        found = (await API.tags(activeSegment)).suggestions;
+        found = (await API.tags(activeSegment, 8, activeLookupController?.signal)).suggestions;
       } catch (error) {
-        return; // suggestions are optional; stay quiet on transient network errors
+        return; // cancelled by newer keystroke or transient network error
+      } finally {
+        if (runId === searchRunId) activeLookupController = null;
       }
       state.suggestionCache.set(activeSegment, found);
     }

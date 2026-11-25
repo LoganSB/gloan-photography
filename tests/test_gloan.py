@@ -234,6 +234,22 @@ class FrontendSyntaxTest(unittest.TestCase):
         self.assertNotIn("localStorage.setItem('gloan-token'", api_source)
         self.assertIn('createTurnstileController(', app_source)
         self.assertIn('createTurnstileController(', lightbox_source)
+        # Asymmetric UI responsiveness: progressive thumbnail->HD upgrade, stale loader abort, background status pill,
+        # request cancellation, and non-blocking gallery loading state.
+        self.assertIn('id="bgStatus"', html_text)
+        self.assertIn('id="lbHdBadge"', html_text)
+        self.assertIn('export function runBackgroundTask(', api_source)
+        self.assertIn('abortSlideLoaders()', lightbox_source)
+        self.assertIn('loadedFullUrls', lightbox_source)
+        self.assertIn('runBackgroundTask(', lightbox_source)
+        self.assertIn('runBackgroundTask(', upload_source)
+        self.assertIn('AbortController', gallery_source)
+        self.assertIn('AbortController', search_source)
+        self.assertNotIn('#galleryHost.loading{opacity:.55;pointer-events:none}', css_source)
+        # Readable, full-width mobile toast with capped duration and tap-to-dismiss.
+        self.assertIn('Math.min(5500', api_source)
+        self.assertIn('toastEl.onclick', api_source)
+        self.assertIn('overflow-wrap:anywhere', css_source)
 
         # Validate static/masonry_templates.json: 4-8 slots per template, exact non-overlapping 12x6 coverage,
         # and at least one template supporting 3 stacked portrait images.
@@ -262,7 +278,9 @@ class FrontendSyntaxTest(unittest.TestCase):
         self.assertIn("classList.add('loading')", lightbox_source)
         self.assertIn('pauseGalleryImageLoads()', lightbox_source)
         self.assertIn('requestAnimationFrame(', lightbox_source)
-        self.assertIn('withBusy(', lightbox_source)
+        self.assertIn('runBackgroundTask(', lightbox_source)
+        self.assertIn('withBusy(', app_source)
+        self.assertIn('withBusy(', gallery_source)
         self.assertIn('SWIPE_CONFIRM_PX', lightbox_source)
         self.assertIn('if (pullDistance < 0)', lightbox_source)
         self.assertIn('id="swipePrev"', html_text)

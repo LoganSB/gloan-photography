@@ -134,6 +134,7 @@
     <div class="swipe-edge left" id="swipePrev" aria-hidden="true"><span>‹</span></div>
     <button class="nav l" id="prev">‹</button>
     <div class="lb-loader" id="lbLoader" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span>Loading image…</span></div>
+    <div class="lb-hd-badge" id="lbHdBadge" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span>Loading full resolution…</span></div>
     <img id="lbImg" alt="">
     <button class="nav r" id="next">›</button>
     <div class="swipe-edge right" id="swipeNext" aria-hidden="true"><span>›</span></div>
@@ -144,6 +145,7 @@
   <aside class="story" id="story"><button class="x" id="storyX" title="Hide story">✕</button><h4>The story</h4><h3 id="stTitle"></h3><p id="stBody"></p></aside>
   <div class="pbar" id="pbar"></div>
 </div>
+<div class="bg-status" id="bgStatus" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span id="bgStatusText"></span></div>
 <div class="toast" id="toast"></div>
 
 <script type="module" src="/static/app.js"></script>

@@ -9,15 +9,16 @@ import {
   escapeHtml,
   isOwner,
   parseTags,
+  runBackgroundTask,
   select,
   setOverlayOpen,
   toast,
-  withBusy,
 } from './api.js';
 import { pauseGalleryImageLoads, refresh, resumeGalleryImageLoads, state, suggestionChips } from './gallery.js';
 import { attachTagAutocomplete } from './search.js';
 
 const SLIDE_INTERVAL_MS = 4500;
+const MAX_CACHED_FULL_URLS = 64;
 const tagTurnstile = createTurnstileController('#tagTurnstileBox');
 
 let currentIndex = 0;
@@ -29,6 +30,39 @@ let stagedManualTags = [];
 let stagedAiTags = [];
 let tagInputAutocomplete = null;
 let slideLoadRunId = 0; // bumped on each slide change so an earlier full-res load cannot overwrite a newer slide
+let pendingBadgeCount = 0;
+const loadedFullUrls = new Set(); // full-res URLs already decoded in browser cache this session
+let activeFullLoader = null;
+let activePreloaders = [];
+
+/**
+ * Remember that `url` is decoded in the browser cache (bounded FIFO set) for 0ms instant slide revisits.
+ */
+function markFullUrlLoaded(url) {
+  if (!url) return;
+  if (loadedFullUrls.has(url)) loadedFullUrls.delete(url);
+  loadedFullUrls.add(url);
+  if (loadedFullUrls.size > MAX_CACHED_FULL_URLS) {
+    loadedFullUrls.delete(loadedFullUrls.values().next().value);
+  }
+}
+
+/**
+ * Immediately abort any in-flight full-resolution slide or neighbour preload downloads so rapid Next/Prev
+ * navigation never stalls behind superseded multi-megabyte transfers.
+ */
+function abortSlideLoaders() {
+  if (activeFullLoader) {
+    activeFullLoader.onload = activeFullLoader.onerror = null;
+    activeFullLoader.src = '';
+    activeFullLoader = null;
+  }
+  for (const loader of activePreloaders) {
+    loader.onload = loader.onerror = null;
+    loader.src = '';
+  }
+  activePreloaders = [];
+}
 
 /**
  * Return the currently displayed photo in the lightbox, if any.
@@ -51,28 +85,28 @@ export function isSlideshowPlaying() {
  */
 export function openLightbox(index) {
   pauseGalleryImageLoads();
+  abortSlideLoaders();
   currentIndex = index;
   const lightboxEl = select('#lb');
   const stageBox = select('#sbox');
-  const stageImage = select('#lbImg');
-  stageBox.classList.remove('zoom');
-  stageBox.classList.add('loading');
-  stageImage.removeAttribute('src');
+  stageBox.classList.remove('zoom', 'loading', 'upgrading');
   setOverlayOpen(lightboxEl, true);
   buildStrip();
   showSlide(true);
 }
 
 /**
- * Close the lightbox, stop any running slideshow, resume any unfinished gallery tile loads and exit fullscreen.
+ * Close the lightbox at 0ms, abort in-flight full-res downloads, stop any slideshow, and resume gallery tiles
+ * asynchronously on the next paint frame.
  */
 export function closeLightbox() {
   stopSlideshow();
   closeShareModal();
+  abortSlideLoaders();
   slideLoadRunId++;
   select('#lb').classList.remove('show-edit', 'chromeless');
   setOverlayOpen('#lb', false);
-  select('#sbox').classList.remove('zoom', 'loading');
+  select('#sbox').classList.remove('zoom', 'loading', 'upgrading');
   select('#lbImg').removeAttribute('src');
   if (document.fullscreenElement) document.exitFullscreen();
   // Remove ?photo=<id> from the browser URL when closing the lightbox so refreshing returns to the gallery.
@@ -81,7 +115,12 @@ export function closeLightbox() {
     currentUrl.searchParams.delete('photo');
     window.history.replaceState({}, '', currentUrl.pathname + currentUrl.search + currentUrl.hash);
   }
-  resumeGalleryImageLoads();
+  const resumeAsync = () => resumeGalleryImageLoads();
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(resumeAsync);
+  } else {
+    setTimeout(resumeAsync, 0);
+  }
 }
 
 /**
@@ -188,21 +227,11 @@ async function shareNativeOrInstagram() {
  * Updates the UI chrome and shows the spinning "Loading image…" indicator immediately, then defers starting
  * the full-resolution image network request until after the next paint frame so opening the popup never blocks.
  */
-export function showSlide(instant = false) {
-  const photo = state.view[currentIndex];
-  if (!photo) {
-    closeLightbox();
-    return;
-  }
-  const runId = ++slideLoadRunId;
+/**
+ * Render the lightbox caption, clickable tag pills, edit fields, and story drawer for `photo`.
+ */
+function renderLightboxMeta(photo) {
   const lightboxEl = select('#lb');
-  const stageBox = select('#sbox');
-  const stageImage = select('#lbImg');
-
-  // Update metadata, controls, story drawer and active strip thumbnail immediately on click.
-  stageBox.classList.add('loading');
-  stageImage.classList.remove('out');
-  stageImage.removeAttribute('src');
   select('#lbTitle').textContent = photo.title || 'Untitled';
   select('#lbCnt').textContent = `${currentIndex + 1} / ${state.view.length}`;
   const manualTags = photo.tags || [];
@@ -226,12 +255,56 @@ export function showSlide(instant = false) {
     };
   });
   select('#eTitle').value = photo.title || '';
-  select('#eTags').value = photo.tags.join(', ');
+  select('#eTags').value = manualTags.join(', ');
   select('#eStory').value = photo.story || '';
   select('#stTitle').textContent = photo.title || 'Untitled';
   select('#stBody').textContent = photo.story || '';
   select('#storyBtn').style.display = photo.story ? '' : 'none';
   lightboxEl.classList.toggle('story-open', !!photo.story && storyOpen);
+}
+
+/**
+ * Preload adjacent slides (`+1` next first, then `-1` prev) at low priority in the background so the next
+ * slideshow click or auto-advance renders instantaneously without competing with the active photo.
+ */
+function preloadNeighbours(runId) {
+  if (runId !== slideLoadRunId || state.view.length < 2) return;
+  const seen = new Set();
+  for (const delta of [1, -1]) {
+    const neighbour = state.view[(currentIndex + delta + state.view.length) % state.view.length];
+    if (!neighbour || !neighbour.url || seen.has(neighbour.url) || loadedFullUrls.has(neighbour.url)) continue;
+    seen.add(neighbour.url);
+    const loader = new Image();
+    try { loader.fetchPriority = 'low'; } catch (error) { /* optional hint */ }
+    loader.decoding = 'async';
+    loader.onload = () => {
+      markFullUrlLoaded(neighbour.url);
+    };
+    loader.src = neighbour.url;
+    activePreloaders.push(loader);
+  }
+}
+
+/**
+ * Render `state.view[currentIndex]` with asymmetric progressive loading:
+ * 1. Immediately aborts superseded full-res/preload downloads so rapid Next/Prev never queues up.
+ * 2. Paints cached full-res (0ms) or the cached thumbnail immediately (0ms, zero black flash) while upgrading
+ *    to full resolution asynchronously in the background.
+ * 3. Preloads `[+1, -1]` neighbours in the background once the active slide finishes decoding.
+ */
+export function showSlide(instant = false) {
+  const photo = state.view[currentIndex];
+  if (!photo) {
+    closeLightbox();
+    return;
+  }
+  abortSlideLoaders();
+  const runId = ++slideLoadRunId;
+  const stageBox = select('#sbox');
+  const stageImage = select('#lbImg');
+
+  renderLightboxMeta(photo);
+  stageImage.classList.remove('out');
   select('#strip').querySelectorAll('img').forEach((thumbImg, idx) => {
     thumbImg.classList.toggle('on', idx === currentIndex);
     if (idx === currentIndex) {
@@ -239,19 +312,53 @@ export function showSlide(instant = false) {
     }
   });
 
-  // Start the full-resolution download on the next frame so the open modal and "Loading image…" spinner paint first.
+  if (loadedFullUrls.has(photo.url)) {
+    stageBox.classList.remove('loading', 'upgrading');
+    stageImage.src = photo.url;
+    preloadNeighbours(runId);
+    if (isPlaying) restartProgressBar();
+    return;
+  }
+
+  // Instant thumbnail preview (already in browser cache from gallery/strip) while full-res loads asynchronously.
+  if (photo.thumbUrl) {
+    stageBox.classList.remove('loading');
+    stageBox.classList.add('upgrading');
+    stageImage.src = photo.thumbUrl;
+  } else {
+    stageBox.classList.remove('upgrading');
+    stageBox.classList.add('loading');
+    stageImage.removeAttribute('src');
+  }
+
   const startFullDownload = () => {
     if (runId !== slideLoadRunId) return;
     const fullLoader = new Image();
-    fullLoader.onload = fullLoader.onerror = () => {
-      if (runId !== slideLoadRunId) return; // user navigated to another slide before this one finished
+    activeFullLoader = fullLoader;
+    try { fullLoader.fetchPriority = 'high'; } catch (error) { /* optional hint */ }
+    fullLoader.decoding = 'async';
+
+    const finishSwap = () => {
+      if (runId !== slideLoadRunId) return;
+      if (activeFullLoader === fullLoader) activeFullLoader = null;
+      markFullUrlLoaded(photo.url);
       stageImage.src = photo.url;
-      stageBox.classList.remove('loading');
-      // Only preload neighbours AFTER the current full-size image has finished loading so we never compete for sockets.
-      [1, -1].forEach(delta => {
-        const neighbour = state.view[(currentIndex + delta + state.view.length) % state.view.length];
-        if (neighbour) new Image().src = neighbour.url;
-      });
+      stageBox.classList.remove('loading', 'upgrading');
+      preloadNeighbours(runId);
+    };
+
+    fullLoader.onload = () => {
+      if (runId !== slideLoadRunId) return;
+      if (typeof fullLoader.decode === 'function') {
+        fullLoader.decode().then(finishSwap, finishSwap);
+      } else {
+        finishSwap();
+      }
+    };
+    fullLoader.onerror = () => {
+      if (runId !== slideLoadRunId) return;
+      if (activeFullLoader === fullLoader) activeFullLoader = null;
+      stageBox.classList.remove('loading', 'upgrading');
     };
     fullLoader.src = photo.url;
   };
@@ -346,48 +453,57 @@ export function startSlideshow() {
 }
 
 /**
- * Save title, tags and story edits from the lightbox inline editor.
+ * Optimistically apply title, tags and story edits from the lightbox inline editor at 0ms, then sync in background.
  */
-export async function saveEdit() {
+export function saveEdit() {
   const photo = state.view[currentIndex];
   if (!photo) return;
-  await withBusy(select('#eSave'), 'Saving…', async () => {
+  const previous = { title: photo.title, tags: [...(photo.tags || [])], story: photo.story || '' };
+  const nextTitle = select('#eTitle').value.trim();
+  const nextTags = parseTags(select('#eTags').value);
+  const nextStory = select('#eStory').value;
+
+  photo.title = nextTitle;
+  photo.tags = nextTags;
+  photo.story = nextStory;
+  select('#lb').classList.remove('show-edit');
+  renderLightboxMeta(photo);
+
+  runBackgroundTask('Saving changes…', async () => {
     try {
-      const updated = await API.update(
-        photo.id,
-        select('#eTitle').value.trim(),
-        parseTags(select('#eTags').value),
-        select('#eStory').value
-      );
+      const updated = await API.update(photo.id, nextTitle, nextTags, nextStory);
       Object.assign(photo, updated);
+      if (currentLightboxPhoto()?.id === photo.id) renderLightboxMeta(photo);
+      await refresh({ silent: true });
+      toast('Saved');
     } catch (error) {
+      Object.assign(photo, previous);
+      if (currentLightboxPhoto()?.id === photo.id) renderLightboxMeta(photo);
       toast(error.message);
-      return;
     }
-    await afterPhotoEdit(photo.id, 'Saved');
   });
 }
 
 /**
- * Reload the current page after a photo's metadata changes and keep the lightbox focused on that photo.
+ * Reload the current page silently in the background after metadata changes while preserving the active lightbox slide.
  */
 export async function afterPhotoEdit(photoId, message) {
-  await refresh();
+  await refresh({ silent: true });
   const lightboxEl = select('#lb');
   if (!lightboxEl.classList.contains('open')) {
-    toast(message);
+    if (message) toast(message);
     return;
   }
   const newIndex = state.view.findIndex(item => item.id === photoId);
   if (newIndex < 0) {
     closeLightbox();
-    toast(message + ' — hidden by current filter');
+    toast((message || 'Updated') + ' — hidden by current filter');
     return;
   }
   currentIndex = newIndex;
   buildStrip();
-  showSlide(true);
-  toast(message);
+  renderLightboxMeta(state.view[currentIndex]);
+  if (message) toast(message);
 }
 
 /**
@@ -395,6 +511,7 @@ export async function afterPhotoEdit(photoId, message) {
  */
 export function updatePendingTagsBadge(count) {
   const safeCount = Math.max(0, Number(count) || 0);
+  pendingBadgeCount = safeCount;
   const headerBtn = select('#pendingTagsBtn');
   if (headerBtn) {
     headerBtn.textContent = safeCount > 0 ? `Pending tags (${safeCount})` : 'Pending tags';
@@ -494,20 +611,33 @@ async function renderPhotoPendingTags(photoId) {
       const actions = createElement('div', 'actions');
       const acceptBtn = createElement('button', 'btn primary', 'Accept');
       const rejectBtn = createElement('button', 'btn danger', 'Reject');
-      const moderate = async (action, btn) => {
-        await withBusy(btn, '…', async () => {
-          const res = await API.moderatePendingTag(photoId, tag, action);
-          updatePendingTagsBadge(res.pendingTagCount);
-          if (action === 'accept' && !stagedManualTags.includes(tag)) {
-            stagedManualTags.push(tag);
-            renderCurrentTagChips();
+      const moderate = action => {
+        // Optimistic 0ms UI update: remove row and decrement badge immediately, sync in background.
+        row.remove();
+        if (!list.children.length) wrap.style.display = 'none';
+        updatePendingTagsBadge(Math.max(0, pendingBadgeCount - 1));
+        if (action === 'accept' && !stagedManualTags.includes(tag)) {
+          stagedManualTags.push(tag);
+          renderCurrentTagChips();
+          if (taggingPhoto && taggingPhoto.id === photoId) {
+            taggingPhoto.tags = [...stagedManualTags];
+            if (currentLightboxPhoto()?.id === photoId) renderLightboxMeta(taggingPhoto);
           }
-          await afterPhotoEdit(photoId, action === 'accept' ? `Accepted tag "${tag}"` : `Rejected tag "${tag}"`);
-          await renderPhotoPendingTags(photoId);
+        }
+        runBackgroundTask(action === 'accept' ? `Accepting "${tag}"…` : `Rejecting "${tag}"…`, async () => {
+          try {
+            const res = await API.moderatePendingTag(photoId, tag, action);
+            updatePendingTagsBadge(res.pendingTagCount);
+            if (action === 'accept') await refresh({ silent: true });
+            toast(action === 'accept' ? `Accepted "${tag}"` : `Rejected "${tag}"`);
+          } catch (error) {
+            toast(error.message);
+            renderPhotoPendingTags(photoId);
+          }
         });
       };
-      acceptBtn.onclick = () => moderate('accept', acceptBtn);
-      rejectBtn.onclick = () => moderate('reject', rejectBtn);
+      acceptBtn.onclick = () => moderate('accept');
+      rejectBtn.onclick = () => moderate('reject');
       actions.append(acceptBtn, rejectBtn);
       row.append(actions);
       list.append(row);
@@ -560,9 +690,10 @@ export function closeTagModal() {
 }
 
 /**
- * Save tag additions/deletions (admin) or submit tag suggestions for admin approval (visitor).
+ * Optimistically apply tag additions/deletions (admin) or submit tag suggestions (visitor) at 0ms,
+ * closing the modal immediately and synchronizing with the server in the background.
  */
-export async function submitTags() {
+export function submitTags() {
   const photo = taggingPhoto;
   if (!photo) {
     closeTagModal();
@@ -578,18 +709,18 @@ export async function submitTags() {
       toast('Please complete the CAPTCHA verification first.');
       return;
     }
-    await withBusy(select('#tagGo'), 'Submitting…', async () => {
+    const captchaToken = tagTurnstile.getToken();
+    tagTurnstile.reset();
+    closeTagModal();
+    runBackgroundTask('Submitting tag suggestion…', async () => {
       try {
-        const reply = await API.suggestTags(photo.id, enteredTags, tagTurnstile.getToken());
-        tagTurnstile.reset();
-        closeTagModal();
+        const reply = await API.suggestTags(photo.id, enteredTags, captchaToken);
         if (reply.added && reply.added.length) {
           toast(`Submitted ${reply.added.length} tag suggestion${reply.added.length > 1 ? 's' : ''} for admin approval`);
         } else {
           toast('Those tags are already on this photo or awaiting approval');
         }
       } catch (error) {
-        tagTurnstile.reset();
         toast(error.message);
       }
     });
@@ -597,21 +728,30 @@ export async function submitTags() {
   }
 
   const mergedManualTags = [...new Set([...stagedManualTags, ...enteredTags])];
-  const origManual = (photo.tags || []).join(',');
-  const origAi = (photo.aiTags || []).join(',');
-  if (mergedManualTags.join(',') === origManual && stagedAiTags.join(',') === origAi) {
+  const nextAiTags = [...stagedAiTags];
+  const prevManual = [...(photo.tags || [])];
+  const prevAi = [...(photo.aiTags || [])];
+  if (mergedManualTags.join(',') === prevManual.join(',') && nextAiTags.join(',') === prevAi.join(',')) {
     closeTagModal();
     return;
   }
-  await withBusy(select('#tagGo'), 'Saving…', async () => {
+  // Optimistic 0ms update + close modal immediately; sync & rollback on failure in background.
+  photo.tags = mergedManualTags;
+  photo.aiTags = nextAiTags;
+  closeTagModal();
+  if (currentLightboxPhoto()?.id === photo.id) renderLightboxMeta(photo);
+
+  runBackgroundTask('Saving tags…', async () => {
     try {
-      await API.update(photo.id, photo.title || '', mergedManualTags, photo.story || '', stagedAiTags);
+      await API.update(photo.id, photo.title || '', mergedManualTags, photo.story || '', nextAiTags);
+      await refresh({ silent: true });
+      toast('Tags updated');
     } catch (error) {
+      photo.tags = prevManual;
+      photo.aiTags = prevAi;
+      if (currentLightboxPhoto()?.id === photo.id) renderLightboxMeta(photo);
       toast(error.message);
-      return;
     }
-    closeTagModal();
-    await afterPhotoEdit(photo.id, 'Tags updated');
   });
 }
 
@@ -658,22 +798,28 @@ function renderPendingQueue(items) {
       const actions = createElement('div', 'actions');
       const acceptBtn = createElement('button', 'btn primary', 'Accept');
       const rejectBtn = createElement('button', 'btn danger', 'Reject');
-      const moderate = async (action, btn) => {
-        await withBusy(btn, '…', async () => {
+      const moderate = action => {
+        // Optimistic 0ms removal from the moderation queue; sync & refresh gallery in background.
+        row.remove();
+        if (!list.children.length) card.remove();
+        if (!body.children.length) {
+          body.append(createElement('div', 'hint', 'No pending visitor tag suggestions.'));
+        }
+        updatePendingTagsBadge(Math.max(0, pendingBadgeCount - 1));
+        runBackgroundTask(action === 'accept' ? `Accepting "${tag}"…` : `Rejecting "${tag}"…`, async () => {
           try {
             const res = await API.moderatePendingTag(item.photoId, tag, action);
             updatePendingTagsBadge(res.pendingTagCount);
-            if (action === 'accept') await refresh();
-            const updated = await API.listPendingTags();
-            renderPendingQueue(updated.items || []);
+            if (action === 'accept') await refresh({ silent: true });
             toast(action === 'accept' ? `Accepted "${tag}"` : `Rejected "${tag}"`);
           } catch (error) {
             toast(error.message);
+            if (select('#pendingModal').classList.contains('open')) openPendingModal();
           }
         });
       };
-      acceptBtn.onclick = () => moderate('accept', acceptBtn);
-      rejectBtn.onclick = () => moderate('reject', rejectBtn);
+      acceptBtn.onclick = () => moderate('accept');
+      rejectBtn.onclick = () => moderate('reject');
       actions.append(acceptBtn, rejectBtn);
       row.append(actions);
       list.append(row);
@@ -692,26 +838,38 @@ export function closePendingModal() {
 }
 
 /**
- * Delete the currently viewed photo after owner confirmation.
+ * Optimistically remove the currently viewed photo from the lightbox at 0ms after confirmation,
+ * advancing immediately while DELETE /api/photos/<id> and silent gallery sync finish in the background.
  */
-export async function deleteCurrentPhoto() {
+export function deleteCurrentPhoto() {
   const photo = state.view[currentIndex];
   if (!photo || !confirm(`Delete “${photo.title || 'Untitled'}”?`)) return;
-  await withBusy(select('#delBtn'), '…', async () => {
-    try {
-      await API.remove(photo.id);
-    } catch (error) {
-      toast(error.message);
-      return;
-    }
-    await refresh();
-    if (!state.view.length) {
-      closeLightbox();
-      return;
-    }
+  const previousView = [...state.view];
+  const previousIndex = currentIndex;
+
+  state.view = state.view.filter(item => item.id !== photo.id);
+  if (!state.view.length) {
+    closeLightbox();
+  } else {
     currentIndex = Math.min(currentIndex, state.view.length - 1);
     buildStrip();
     showSlide(true);
+  }
+
+  runBackgroundTask('Deleting photo…', async () => {
+    try {
+      await API.remove(photo.id);
+      await refresh({ silent: true });
+      toast('Photo deleted');
+    } catch (error) {
+      state.view = previousView;
+      currentIndex = Math.min(previousIndex, state.view.length - 1);
+      if (select('#lb').classList.contains('open')) {
+        buildStrip();
+        showSlide(true);
+      }
+      toast(error.message);
+    }
   });
 }
 

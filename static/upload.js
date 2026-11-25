@@ -2,7 +2,7 @@
  * Photo upload staging modal, client-side canvas downscaling, drag-and-drop and procedural demo images.
  */
 
-import { API, createElement, escapeHtml, isOwner, parseTags, select, setOverlayOpen, toast, withBusy } from './api.js';
+import { API, createElement, escapeHtml, isOwner, parseTags, runBackgroundTask, select, setOverlayOpen, toast } from './api.js';
 import { refresh, state, suggestionChips } from './gallery.js';
 import { attachTagAutocomplete } from './search.js';
 
@@ -81,34 +81,52 @@ async function resizeImage(file, maxEdgePx = 2400) {
 }
 
 /**
- * Upload all staged photos sequentially, updating the progress bar.
+ * Close the upload modal immediately and resize/upload staged photos asynchronously in the background
+ * (2 concurrent workers) with a non-blocking `#bgStatus` progress pill so the user can keep browsing.
  * Note: Does NOT trigger server-side thumbnail generation automatically so Cloud Run CPU time is never spent
  * unexpectedly on upload; thumbnails are generated on the local computer or via the explicit footer link.
  */
-export async function saveStaged() {
-  await withBusy(select('#saveUp'), 'Uploading…', async () => {
-    const sharedTags = parseTags(select('#allTags').value);
-    const progressEl = select('#prog');
-    progressEl.style.display = 'block';
+export function saveStaged() {
+  if (!stagedFiles.length) return;
+  const itemsToUpload = stagedFiles.map(item => ({
+    file: item.file,
+    title: item.title.trim(),
+    tags: item.tags,
+  }));
+  const sharedTags = parseTags(select('#allTags').value);
+  const total = itemsToUpload.length;
+  closeUpload();
+  toast(`Uploading ${total} photo${total > 1 ? 's' : ''} in background…`);
+
+  runBackgroundTask(`Uploading 0 / ${total}…`, async updateLabel => {
     let completed = 0;
-    for (const item of stagedFiles) {
-      try {
-        const blob = await resizeImage(item.file);
-        const mergedTags = [...new Set([...sharedTags, ...parseTags(item.tags)])];
-        await API.upload(blob, item.title.trim(), mergedTags);
-      } catch (error) {
-        console.error(error);
-        toast(`${item.file.name}: ${error.message}`);
+    let succeeded = 0;
+    let nextIdx = 0;
+    const workerCount = Math.min(2, total);
+
+    const worker = async () => {
+      while (nextIdx < total) {
+        const item = itemsToUpload[nextIdx++];
+        try {
+          const blob = await resizeImage(item.file);
+          const mergedTags = [...new Set([...sharedTags, ...parseTags(item.tags)])];
+          await API.upload(blob, item.title, mergedTags);
+          succeeded++;
+        } catch (error) {
+          console.error(error);
+          toast(`${item.file.name}: ${error.message}`);
+        }
+        completed++;
+        updateLabel(`Uploading ${completed} / ${total}…`);
       }
-      progressEl.firstElementChild.style.width = (++completed / stagedFiles.length * 100) + '%';
+    };
+
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    if (succeeded > 0) {
+      state.page = 0;
+      await refresh({ silent: true });
+      toast(`Added ${succeeded} photo${succeeded > 1 ? 's' : ''}`);
     }
-    state.page = 0;
-    await refresh(); // newest first lands on page 1
-    progressEl.style.display = 'none';
-    progressEl.firstElementChild.style.width = '0';
-    const count = stagedFiles.length;
-    closeUpload();
-    toast(`Added ${count} photo${count > 1 ? 's' : ''}`);
   });
 }
 
