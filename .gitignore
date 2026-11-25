@@ -7,3 +7,4 @@ __pycache__/
 /data/passkey.json
 /data/session.key
 PENTEST_RESULTS.md
+certs/

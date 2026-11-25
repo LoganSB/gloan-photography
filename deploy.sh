@@ -26,7 +26,7 @@ gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member="serviceAc
 # overwrite each other's edits. One instance easily serves a personal gallery.
 gcloud run deploy "$SERVICE" --source . --region "$REGION" --allow-unauthenticated \
     --max-instances=1 --min-instances=0 --cpu=1 --memory=512Mi --concurrency=40 --timeout=60 \
-    --set-env-vars="GLOAN_TURNSTILE_SITE_KEY=${GLOAN_TURNSTILE_SITE_KEY:-},GLOAN_TURNSTILE_SECRET_KEY=${GLOAN_TURNSTILE_SECRET_KEY:-},GLOAN_GEMINI_API_KEY=${GLOAN_GEMINI_API_KEY:-}" \
+    --set-env-vars="GLOAN_ALLOWED_HOSTS=${GLOAN_ALLOWED_HOSTS:-gloan.me,www.gloan.me,*.run.app},GLOAN_TURNSTILE_SITE_KEY=${GLOAN_TURNSTILE_SITE_KEY:-},GLOAN_TURNSTILE_SECRET_KEY=${GLOAN_TURNSTILE_SECRET_KEY:-},GLOAN_GEMINI_API_KEY=${GLOAN_GEMINI_API_KEY:-}" \
     --add-volume="name=data,type=cloud-storage,bucket=${BUCKET}" \
     --add-volume-mount="volume=data,mount-path=/data" \
-    --args="--host,0.0.0.0,--proxy-header,X-Forwarded-For,--proxy-any-peer"
+    --args="--host,0.0.0.0,--proxy-header,X-Forwarded-For,--proxy-any-peer,--https-redirect"

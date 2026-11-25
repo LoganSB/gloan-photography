@@ -10,7 +10,15 @@
 <body>
 
 <header class="top"><div class="wrap bar">
-  <div class="brand">Gloan <span>/ photography</span></div>
+  <div class="bar-row">
+    <div class="brand">Gloan <span>/ photography</span></div>
+    <div class="spacer"></div>
+    <button class="btn" id="slideBtn" title="Play slideshow">▶ <span class="lbl">Slideshow</span></button>
+    <button class="btn pending-btn" id="pendingTagsBtn" title="Review pending tag suggestions">Pending tags</button>
+    <button class="btn" id="authBtn" title="Admin login"><span class="lbl">Admin login</span></button>
+    <button class="btn primary owner-only" id="upBtn"><span class="lbl">Upload</span></button>
+    <button class="btn icon" id="themeBtn" title="Toggle theme">◐</button>
+  </div>
   <!-- Static (not rebuilt by render()) so typing is never interrupted when the gallery refreshes. -->
   <div class="search">
     <input class="field" id="tagSearch" type="search" placeholder="Search tags… (e.g. *wint or *winter, bryce)" autocomplete="off"
@@ -18,19 +26,20 @@
       role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="tagSuggest">
     <ul class="suggest" id="tagSuggest" role="listbox"></ul>
   </div>
-  <div class="spacer"></div>
-  <button class="btn" id="slideBtn" title="Play slideshow">▶ <span class="lbl">Slideshow</span></button>
-  <button class="btn" id="authBtn" title="Admin login"><span class="lbl">Admin login</span></button>
-  <button class="btn primary owner-only" id="upBtn"><span class="lbl">Upload</span></button>
-  <button class="btn icon" id="themeBtn" title="Toggle theme">◐</button>
 </div></header>
 
-<main class="wrap">
-  <div class="filters" id="filters"></div>
-  <div id="galleryHost"></div>
+<main class="wrap gallery-layout">
+  <aside class="tag-sidebar" id="tagSidebar" aria-label="Filter by tag">
+    <div class="sidebar-title">Tags</div>
+    <ul class="tag-list" id="tagList"></ul>
+  </aside>
+  <section class="gallery-main">
+    <div class="filters" id="filters"></div>
+    <div id="galleryHost"></div>
+  </section>
 </main>
 
-<footer><div class="wrap"><div>© Gloan</div><div class="owner-only footer-links" id="scanWrap"><a id="scanBtn">Scan folder for new photos</a><a id="thumbBtn">Generate thumbnails</a><a id="passkeyRegBtn">Register Passkey</a></div></div></footer>
+<footer><div class="wrap"><div>© Gloan</div><div class="owner-only footer-links" id="scanWrap"><a id="pendingTagsLink">Pending tag suggestions</a><a id="scanBtn">Scan folder for new photos</a><a id="thumbBtn">Generate thumbnails</a><a id="clearAiTagsBtn">Clear AI tags</a><a id="passkeyRegBtn">Register Passkey</a></div></div></footer>
 
 <!-- upload modal -->
 <div class="modal" id="upModal"><div class="panel">
@@ -38,7 +47,10 @@
   <div class="body">
     <div class="row" style="display:flex;gap:10px;flex-wrap:wrap">
       <button class="btn" id="pick">Choose files…</button>
-      <input class="field" id="allTags" type="search" placeholder="Tags for all photos (comma separated)" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" style="flex:1;min-width:220px">
+      <div class="search" style="flex:1;min-width:220px;max-width:none">
+        <input class="field" id="allTags" type="search" placeholder="Tags for all photos (comma separated)" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="allTagsSuggest">
+        <ul class="suggest" id="allTagsSuggest" role="listbox"></ul>
+      </div>
     </div>
     <div class="sug" id="sugAll"></div>
     <div class="hint">Large images are resized to 2400px on the long edge to keep storage small. Title and per-photo tags are optional.</div>
@@ -49,33 +61,69 @@
 </div></div>
 <input type="file" id="file" accept="image/*" multiple hidden>
 
-<!-- Admin login (WebAuthn Passkey + Cloudflare Turnstile CAPTCHA) -->
+<!-- Admin login & Passkey registration (WebAuthn Passkey + Cloudflare Turnstile CAPTCHA) -->
 <div class="modal" id="loginModal"><div class="panel" style="width:min(400px,100%)">
-  <header><h2>Admin login</h2><button class="btn icon" id="loginClose">✕</button></header>
+  <header><h2 id="loginModalTitle">Admin login</h2><button class="btn icon" id="loginClose">✕</button></header>
   <div class="body">
     <div id="turnstileBox" style="display:none;justify-content:center;min-height:65px"></div>
-    <button class="btn primary" id="passkeyLoginBtn" style="width:100%;justify-content:center">Sign in with Passkey</button>
-    <button class="btn primary" id="passkeySetupBtn" style="display:none;width:100%;justify-content:center">Register owner Passkey</button>
+    <button class="btn primary" id="passkeyLoginBtn" style="width:100%;justify-content:center">Sign in with QR code</button>
+    <button class="btn" id="passkeyLoginAltBtn" style="width:100%;justify-content:center">Sign in through a different method</button>
+    <button class="btn primary" id="passkeySetupBtn" style="display:none;width:100%;justify-content:center">Register Passkey with QR code</button>
+    <button class="btn" id="passkeySetupAltBtn" style="display:none;width:100%;justify-content:center">Register a passkey through a different method</button>
     <div class="hint" id="loginErr"></div>
   </div>
 </div></div>
 
-<!-- add tags (owner only; above the lightbox, which is z-index 80) -->
-<div class="modal" id="tagModal" style="z-index:90"><div class="panel" style="width:min(420px,100%)">
-  <header><h2 id="tagTitle">Add tags</h2><button class="btn icon" id="tagClose">✕</button></header>
+<!-- manage tags (owner: add/delete + moderate) & suggest tags (visitors: submitted for admin approval) -->
+<div class="modal" id="tagModal" style="z-index:90"><div class="panel" style="width:min(460px,100%)">
+  <header><h2 id="tagTitle">Manage tags</h2><button class="btn icon" id="tagClose">✕</button></header>
   <div class="body">
-    <input class="field" id="tagInput" type="search" name="photo-tags-entry" placeholder="Tags to add (comma separated)" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other">
+    <div id="tagCurrentWrap" class="tag-section">
+      <div class="hint" id="tagCurrentLabel">Current tags</div>
+      <div class="tag-edit-list" id="tagCurrentChips"></div>
+    </div>
+    <div id="tagPendingWrap" class="tag-section" style="display:none">
+      <div class="hint">Pending visitor suggestions</div>
+      <div class="pending-tag-list" id="tagPendingList"></div>
+    </div>
+    <div class="search" style="max-width:none">
+      <input class="field" id="tagInput" type="search" name="photo-tags-entry" placeholder="Add tags (comma separated, Tab to autocomplete)" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="tagInputSuggest">
+      <ul class="suggest" id="tagInputSuggest" role="listbox"></ul>
+    </div>
+    <div id="tagTurnstileBox" style="display:none;justify-content:center;min-height:65px"></div>
+    <div class="hint" id="tagHint"></div>
     <div class="sug" id="tagSug"></div>
   </div>
-  <footer><button class="btn primary" id="tagGo">Add tags</button></footer>
+  <footer><button class="btn primary" id="tagGo">Save tags</button></footer>
+</div></div>
+
+<!-- admin pending tag moderation queue -->
+<div class="modal" id="pendingModal" style="z-index:95"><div class="panel" style="width:min(620px,100%)">
+  <header><h2>Pending tag suggestions</h2><button class="btn icon" id="pendingClose">✕</button></header>
+  <div class="body" id="pendingModalBody"></div>
+</div></div>
+
+<!-- share photo modal (above the lightbox, which is z-index 80) -->
+<div class="modal" id="shareModal" style="z-index:90"><div class="panel" style="width:min(440px,100%)">
+  <header><h2 id="shareTitle">Share photo</h2><button class="btn icon" id="shareClose">✕</button></header>
+  <div class="body">
+    <input class="field" id="shareUrlInput" type="text" readonly aria-label="Shareable photo URL">
+    <div class="share-actions">
+      <button class="btn primary" id="shareCopyBtn">Copy link</button>
+      <button class="btn" id="shareFbBtn">Facebook</button>
+      <button class="btn" id="shareNativeBtn">Instagram / Share</button>
+    </div>
+    <div class="hint" id="shareHint">Anyone with this link can view this photo directly. On mobile, Instagram / Share opens your device share sheet.</div>
+  </div>
 </div></div>
 
 <!-- lightbox -->
 <div class="lb" id="lb">
   <div class="lb-top">
     <span class="cnt" id="lbCnt"></span>
+    <button class="btn" id="shareBtn" title="Share" aria-label="Share"><svg class="share-ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg><span class="lbl">Share</span></button>
     <button class="btn" id="storyBtn" style="display:none" title="Story (S)"><span class="lbl">Story</span></button>
-    <button class="btn owner-only" id="addTagBtn" title="Add tags">+ tags</button>
+    <button class="btn" id="addTagBtn" title="Manage or suggest tags">Suggest tags</button>
     <button class="btn owner-only" id="editBtn" title="Edit (E)"><span class="lbl">Edit</span></button>
     <button class="btn" id="playBtn" title="Slideshow (Space)">▶</button>
     <button class="btn" id="fsBtn" title="Fullscreen (F)"><span class="lbl">Fullscreen</span></button>
@@ -83,10 +131,12 @@
     <button class="btn" id="closeBtn" title="Close (Esc)">✕</button>
   </div>
   <div class="stagebox" id="sbox">
+    <div class="swipe-edge left" id="swipePrev" aria-hidden="true"><span>‹</span></div>
     <button class="nav l" id="prev">‹</button>
     <div class="lb-loader" id="lbLoader" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span>Loading image…</span></div>
     <img id="lbImg" alt="">
     <button class="nav r" id="next">›</button>
+    <div class="swipe-edge right" id="swipeNext" aria-hidden="true"><span>›</span></div>
   </div>
   <div class="cap"><h3 id="lbTitle"></h3><div class="t" id="lbTags"></div></div>
   <div class="editrow"><input class="field" id="eTitle" type="search" placeholder="Title" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other"><input class="field" id="eTags" type="search" placeholder="tags, comma separated" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other"><textarea class="field" id="eStory" maxlength="5000" placeholder="The story behind this photo — where, when, what it took to get it…" autocomplete="off" data-form-type="other"></textarea><button class="btn primary" id="eSave">Save</button></div>

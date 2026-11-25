@@ -15,5 +15,10 @@ services:
       - ./tests:/app/tests
       - ./index.html:/app/index.html
       - ./data:/data
+      # Uncomment to mount local TLS certs (e.g. generated with mkcert) for local HTTPS testing:
+      - ./certs:/certs:ro
     environment:
       - PYTHONUNBUFFERED=1
+      - GLOAN_SSL_AUTO=1
+      - GLOAN_SSL_CERT=${GLOAN_SSL_CERT:-}
+      - GLOAN_SSL_KEY=${GLOAN_SSL_KEY:-}

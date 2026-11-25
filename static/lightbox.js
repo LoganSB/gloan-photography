@@ -2,16 +2,32 @@
  * Full-screen lightbox, slideshow playback, story drawer, metadata editor and owner Add-Tags modal.
  */
 
-import { API, createElement, escapeHtml, isOwner, parseTags, select, toast, withBusy } from './api.js';
+import {
+  API,
+  createElement,
+  createTurnstileController,
+  escapeHtml,
+  isOwner,
+  parseTags,
+  select,
+  setOverlayOpen,
+  toast,
+  withBusy,
+} from './api.js';
 import { pauseGalleryImageLoads, refresh, resumeGalleryImageLoads, state, suggestionChips } from './gallery.js';
+import { attachTagAutocomplete } from './search.js';
 
 const SLIDE_INTERVAL_MS = 4500;
+const tagTurnstile = createTurnstileController('#tagTurnstileBox');
 
 let currentIndex = 0;
 let isPlaying = false;
 let slideTimerId = null;
 let storyOpen = true;
 let taggingPhoto = null;
+let stagedManualTags = [];
+let stagedAiTags = [];
+let tagInputAutocomplete = null;
 let slideLoadRunId = 0; // bumped on each slide change so an earlier full-res load cannot overwrite a newer slide
 
 /**
@@ -42,8 +58,7 @@ export function openLightbox(index) {
   stageBox.classList.remove('zoom');
   stageBox.classList.add('loading');
   stageImage.removeAttribute('src');
-  lightboxEl.classList.add('open');
-  document.body.style.overflow = 'hidden';
+  setOverlayOpen(lightboxEl, true);
   buildStrip();
   showSlide(true);
 }
@@ -53,13 +68,119 @@ export function openLightbox(index) {
  */
 export function closeLightbox() {
   stopSlideshow();
+  closeShareModal();
   slideLoadRunId++;
-  select('#lb').classList.remove('open', 'show-edit', 'chromeless');
+  select('#lb').classList.remove('show-edit', 'chromeless');
+  setOverlayOpen('#lb', false);
   select('#sbox').classList.remove('zoom', 'loading');
   select('#lbImg').removeAttribute('src');
-  document.body.style.overflow = '';
   if (document.fullscreenElement) document.exitFullscreen();
+  // Remove ?photo=<id> from the browser URL when closing the lightbox so refreshing returns to the gallery.
+  const currentUrl = new URL(window.location.href);
+  if (currentUrl.searchParams.has('photo')) {
+    currentUrl.searchParams.delete('photo');
+    window.history.replaceState({}, '', currentUrl.pathname + currentUrl.search + currentUrl.hash);
+  }
   resumeGalleryImageLoads();
+}
+
+/**
+ * Open a deep-linked shared photo (`/?photo=<id>`), prepending it to `state.view` if it is on another page.
+ */
+export function openSharedPhoto(photo) {
+  if (!photo || !photo.id) return;
+  let idx = state.view.findIndex(item => item.id === photo.id);
+  if (idx < 0) {
+    state.view = [photo, ...state.view];
+    idx = 0;
+  }
+  openLightbox(idx);
+}
+
+/**
+ * Build the canonical shareable URL for `photo`.
+ */
+export function photoShareUrl(photo) {
+  const url = new URL('/', window.location.origin);
+  url.searchParams.set('photo', photo.id);
+  return url.toString();
+}
+
+/**
+ * Open the share dialog for the currently viewed photo.
+ */
+export function openShareModal() {
+  const photo = currentLightboxPhoto();
+  if (!photo) return;
+  const shareUrl = photoShareUrl(photo);
+  select('#shareTitle').textContent = 'Share — ' + (photo.title || 'Untitled');
+  const input = select('#shareUrlInput');
+  input.value = shareUrl;
+  setOverlayOpen('#shareModal', true);
+  setTimeout(() => input.select(), 20);
+}
+
+/**
+ * Close the share dialog.
+ */
+export function closeShareModal() {
+  setOverlayOpen('#shareModal', false);
+}
+
+/**
+ * Copy the active photo's share URL to the clipboard (using Clipboard API with textarea fallback).
+ */
+export async function copyShareLink() {
+  const photo = currentLightboxPhoto();
+  if (!photo) return;
+  const url = photoShareUrl(photo);
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(url);
+    } else {
+      const input = select('#shareUrlInput');
+      input.value = url;
+      input.select();
+      document.execCommand('copy');
+    }
+    toast('Link copied to clipboard');
+  } catch (error) {
+    toast('Copy the link from the box above');
+  }
+}
+
+/**
+ * Open Facebook's standard web share dialog template for the active photo URL.
+ */
+function shareToFacebook() {
+  const photo = currentLightboxPhoto();
+  if (!photo) return;
+  const fbUrl = 'https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(photoShareUrl(photo));
+  window.open(fbUrl, '_blank', 'noopener,noreferrer,width=640,height=520');
+}
+
+/**
+ * Share via the native Web Share API (Instagram/Messages/AirDrop on mobile) or fall back to copying the link.
+ */
+async function shareNativeOrInstagram() {
+  const photo = currentLightboxPhoto();
+  if (!photo) return;
+  const url = photoShareUrl(photo);
+  if (typeof navigator.share === 'function') {
+    try {
+      await navigator.share({
+        title: photo.title || 'Gloan Photography',
+        text: photo.title || 'Check out this photo on Gloan',
+        url,
+      });
+      closeShareModal();
+      return;
+    } catch (error) {
+      if (error.name === 'AbortError') return;
+    }
+  }
+  await copyShareLink();
+  toast('Link copied — paste into Instagram or any app to share');
 }
 
 /**
@@ -94,10 +215,14 @@ export function showSlide(instant = false) {
   select('#lbTags').querySelectorAll('span').forEach(span => {
     span.onclick = () => {
       closeLightbox();
-      state.activeTags = new Set([span.dataset.t]);
+      const chosenTag = span.dataset.t;
+      const searchInput = select('#tagSearch');
+      if (searchInput) searchInput.value = chosenTag + ', ';
+      state.activeTags.clear();
+      state.searchQuery = chosenTag;
       state.page = 0;
       refresh();
-      scrollTo({ top: 300, behavior: 'smooth' });
+      scrollTo({ top: 0, behavior: 'smooth' });
     };
   });
   select('#eTitle').value = photo.title || '';
@@ -266,47 +391,304 @@ export async function afterPhotoEdit(photoId, message) {
 }
 
 /**
- * Open the owner-only quick "Add tags" modal for `photo`.
+ * Update the header & footer pending-tag badge counts for the logged-in admin.
+ */
+export function updatePendingTagsBadge(count) {
+  const safeCount = Math.max(0, Number(count) || 0);
+  const headerBtn = select('#pendingTagsBtn');
+  if (headerBtn) {
+    headerBtn.textContent = safeCount > 0 ? `Pending tags (${safeCount})` : 'Pending tags';
+    headerBtn.classList.toggle('has-pending', safeCount > 0);
+  }
+  const footerLink = select('#pendingTagsLink');
+  if (footerLink) {
+    footerLink.textContent = safeCount > 0 ? `Pending tag suggestions (${safeCount})` : 'Pending tag suggestions';
+  }
+}
+
+/**
+ * Fetch the latest pending visitor tag count for the logged-in admin and update the UI badge.
+ */
+export async function refreshPendingTagsBadge() {
+  if (!isOwner()) {
+    updatePendingTagsBadge(0);
+    return;
+  }
+  try {
+    const reply = await API.listPendingTags();
+    updatePendingTagsBadge(reply.total || 0);
+  } catch (error) {
+    // Badge refresh is best-effort; stay quiet on transient errors.
+  }
+}
+
+/**
+ * Render the current tags list inside `#tagModal` (removable pills for admins, read-only pills for visitors).
+ */
+function renderCurrentTagChips() {
+  const container = select('#tagCurrentChips');
+  if (!container) return;
+  container.innerHTML = '';
+  const owner = isOwner();
+  const manualSet = new Set(stagedManualTags);
+  const items = [
+    ...stagedManualTags.map(tag => ({ tag, isAi: false })),
+    ...stagedAiTags.filter(tag => !manualSet.has(tag)).map(tag => ({ tag, isAi: true })),
+  ];
+  if (!items.length) {
+    container.append(createElement('span', 'hint', 'No tags yet'));
+    return;
+  }
+  items.forEach(({ tag, isAi }) => {
+    const pill = createElement('span', isAi ? 'tag-pill ai-tag' : 'tag-pill');
+    pill.append(document.createTextNode(tag));
+    if (owner) {
+      const removeBtn = createElement('button', '', '×');
+      removeBtn.type = 'button';
+      removeBtn.title = `Remove ${tag}`;
+      removeBtn.setAttribute('aria-label', `Remove ${tag}`);
+      removeBtn.onclick = () => {
+        if (isAi) {
+          stagedAiTags = stagedAiTags.filter(item => item !== tag);
+        } else {
+          stagedManualTags = stagedManualTags.filter(item => item !== tag);
+        }
+        renderCurrentTagChips();
+        tagInputAutocomplete?.update();
+      };
+      pill.append(removeBtn);
+    }
+    container.append(pill);
+  });
+}
+
+/**
+ * Render pending visitor tag suggestions for `photoId` inside `#tagModal` (admin only).
+ */
+async function renderPhotoPendingTags(photoId) {
+  const wrap = select('#tagPendingWrap');
+  const list = select('#tagPendingList');
+  if (!wrap || !list) return;
+  if (!isOwner()) {
+    wrap.style.display = 'none';
+    list.innerHTML = '';
+    return;
+  }
+  try {
+    const reply = await API.listPendingTags();
+    updatePendingTagsBadge(reply.total || 0);
+    const entry = (reply.items || []).find(item => item.photoId === photoId);
+    const pending = entry ? entry.pendingTags : [];
+    if (!pending.length) {
+      wrap.style.display = 'none';
+      list.innerHTML = '';
+      return;
+    }
+    wrap.style.display = 'flex';
+    list.innerHTML = '';
+    pending.forEach(tag => {
+      const row = createElement('div', 'pending-row');
+      const tagLabel = createElement('span');
+      tagLabel.textContent = tag;
+      row.append(tagLabel);
+      const actions = createElement('div', 'actions');
+      const acceptBtn = createElement('button', 'btn primary', 'Accept');
+      const rejectBtn = createElement('button', 'btn danger', 'Reject');
+      const moderate = async (action, btn) => {
+        await withBusy(btn, '…', async () => {
+          const res = await API.moderatePendingTag(photoId, tag, action);
+          updatePendingTagsBadge(res.pendingTagCount);
+          if (action === 'accept' && !stagedManualTags.includes(tag)) {
+            stagedManualTags.push(tag);
+            renderCurrentTagChips();
+          }
+          await afterPhotoEdit(photoId, action === 'accept' ? `Accepted tag "${tag}"` : `Rejected tag "${tag}"`);
+          await renderPhotoPendingTags(photoId);
+        });
+      };
+      acceptBtn.onclick = () => moderate('accept', acceptBtn);
+      rejectBtn.onclick = () => moderate('reject', rejectBtn);
+      actions.append(acceptBtn, rejectBtn);
+      row.append(actions);
+      list.append(row);
+    });
+  } catch (error) {
+    wrap.style.display = 'none';
+  }
+}
+
+/**
+ * Open the Tag modal for `photo`:
+ * - Admin: add or delete manual/AI tags and accept/reject pending visitor tags.
+ * - Visitor: suggest comma-separated tags (existing or custom) for admin approval.
  */
 export function openTagModal(photo) {
-  if (!isOwner() || !photo) return;
+  if (!photo) return;
+  const owner = isOwner();
   taggingPhoto = photo;
-  select('#tagTitle').textContent = 'Add tags — ' + (photo.title || 'Untitled');
+  stagedManualTags = [...(photo.tags || [])];
+  stagedAiTags = [...(photo.aiTags || [])];
+  select('#tagTitle').textContent = (owner ? 'Manage tags — ' : 'Suggest tags — ') + (photo.title || 'Untitled');
+  select('#tagCurrentLabel').textContent = owner ? 'Current tags (click × to remove)' : 'Current tags';
   select('#tagInput').value = '';
+  select('#tagInput').placeholder = owner
+    ? 'Add tags (comma separated, Tab to autocomplete)'
+    : 'Suggest tags (comma separated, Tab to autocomplete)';
+  select('#tagHint').textContent = owner
+    ? 'Type comma-separated tags to add, or click × on any tag above to delete it.'
+    : 'Suggested tags are sent to the admin for approval before appearing on the site.';
+  select('#tagGo').textContent = owner ? 'Save tags' : 'Submit suggestion';
+  if (owner) {
+    tagTurnstile.hide();
+  } else {
+    tagTurnstile.ensure();
+  }
+  renderCurrentTagChips();
+  renderPhotoPendingTags(photo.id);
   suggestionChips(select('#tagSug'), select('#tagInput'));
-  select('#tagModal').classList.add('open');
+  setOverlayOpen('#tagModal', true);
   setTimeout(() => select('#tagInput').focus(), 30);
 }
 
 /**
- * Close the quick "Add tags" modal.
+ * Close the Manage/Suggest Tags modal.
  */
 export function closeTagModal() {
-  select('#tagModal').classList.remove('open');
+  tagInputAutocomplete?.close();
+  setOverlayOpen('#tagModal', false);
   taggingPhoto = null;
 }
 
 /**
- * Append the newly entered tags to `taggingPhoto` and persist via PATCH /api/photos/<id>.
+ * Save tag additions/deletions (admin) or submit tag suggestions for admin approval (visitor).
  */
 export async function submitTags() {
   const photo = taggingPhoto;
-  const addedTags = parseTags(select('#tagInput').value);
-  if (!photo || !addedTags.length) {
+  if (!photo) {
     closeTagModal();
     return;
   }
-  await withBusy(select('#tagGo'), 'Adding…', async () => {
+  const enteredTags = parseTags(select('#tagInput').value);
+  if (!isOwner()) {
+    if (!enteredTags.length) {
+      toast('Enter one or more tags to suggest');
+      return;
+    }
+    if (tagTurnstile.isRequired() && !tagTurnstile.getToken()) {
+      toast('Please complete the CAPTCHA verification first.');
+      return;
+    }
+    await withBusy(select('#tagGo'), 'Submitting…', async () => {
+      try {
+        const reply = await API.suggestTags(photo.id, enteredTags, tagTurnstile.getToken());
+        tagTurnstile.reset();
+        closeTagModal();
+        if (reply.added && reply.added.length) {
+          toast(`Submitted ${reply.added.length} tag suggestion${reply.added.length > 1 ? 's' : ''} for admin approval`);
+        } else {
+          toast('Those tags are already on this photo or awaiting approval');
+        }
+      } catch (error) {
+        tagTurnstile.reset();
+        toast(error.message);
+      }
+    });
+    return;
+  }
+
+  const mergedManualTags = [...new Set([...stagedManualTags, ...enteredTags])];
+  const origManual = (photo.tags || []).join(',');
+  const origAi = (photo.aiTags || []).join(',');
+  if (mergedManualTags.join(',') === origManual && stagedAiTags.join(',') === origAi) {
+    closeTagModal();
+    return;
+  }
+  await withBusy(select('#tagGo'), 'Saving…', async () => {
     try {
-      const mergedTags = [...new Set([...photo.tags, ...addedTags])];
-      await API.update(photo.id, photo.title || '', mergedTags, photo.story || '');
+      await API.update(photo.id, photo.title || '', mergedManualTags, photo.story || '', stagedAiTags);
     } catch (error) {
       toast(error.message);
       return;
     }
     closeTagModal();
-    await afterPhotoEdit(photo.id, `Added ${addedTags.length} tag${addedTags.length > 1 ? 's' : ''}`);
+    await afterPhotoEdit(photo.id, 'Tags updated');
   });
+}
+
+/**
+ * Open the global Admin Pending Tag Suggestions moderation modal.
+ */
+export async function openPendingModal() {
+  if (!isOwner()) return;
+  const body = select('#pendingModalBody');
+  body.innerHTML = '<div class="hint">Loading pending suggestions…</div>';
+  setOverlayOpen('#pendingModal', true);
+  try {
+    const reply = await API.listPendingTags();
+    updatePendingTagsBadge(reply.total || 0);
+    renderPendingQueue(reply.items || []);
+  } catch (error) {
+    body.innerHTML = `<div class="hint">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+/**
+ * Render the list of photos with pending visitor tag suggestions inside `#pendingModal`.
+ */
+function renderPendingQueue(items) {
+  const body = select('#pendingModalBody');
+  body.innerHTML = '';
+  if (!items.length) {
+    body.append(createElement('div', 'hint', 'No pending visitor tag suggestions.'));
+    return;
+  }
+  items.forEach(item => {
+    const card = createElement('div', 'pending-card');
+    const thumb = createElement('img');
+    thumb.src = item.thumbUrl || item.url;
+    thumb.alt = item.title || 'Photo';
+    const info = createElement('div', 'tag-section');
+    info.append(createElement('h3', '', escapeHtml(item.title || 'Untitled')));
+    const list = createElement('div', 'pending-tag-list');
+    item.pendingTags.forEach(tag => {
+      const row = createElement('div', 'pending-row');
+      const tagLabel = createElement('span');
+      tagLabel.textContent = tag;
+      row.append(tagLabel);
+      const actions = createElement('div', 'actions');
+      const acceptBtn = createElement('button', 'btn primary', 'Accept');
+      const rejectBtn = createElement('button', 'btn danger', 'Reject');
+      const moderate = async (action, btn) => {
+        await withBusy(btn, '…', async () => {
+          try {
+            const res = await API.moderatePendingTag(item.photoId, tag, action);
+            updatePendingTagsBadge(res.pendingTagCount);
+            if (action === 'accept') await refresh();
+            const updated = await API.listPendingTags();
+            renderPendingQueue(updated.items || []);
+            toast(action === 'accept' ? `Accepted "${tag}"` : `Rejected "${tag}"`);
+          } catch (error) {
+            toast(error.message);
+          }
+        });
+      };
+      acceptBtn.onclick = () => moderate('accept', acceptBtn);
+      rejectBtn.onclick = () => moderate('reject', rejectBtn);
+      actions.append(acceptBtn, rejectBtn);
+      row.append(actions);
+      list.append(row);
+    });
+    info.append(list);
+    card.append(thumb, info);
+    body.append(card);
+  });
+}
+
+/**
+ * Close the Admin Pending Tag Suggestions moderation modal.
+ */
+export function closePendingModal() {
+  setOverlayOpen('#pendingModal', false);
 }
 
 /**
@@ -343,6 +725,14 @@ export function initLightboxEvents() {
   select('#prev').onclick = () => goSlide(-1);
   select('#next').onclick = () => goSlide(1);
   select('#closeBtn').onclick = closeLightbox;
+  select('#shareBtn').onclick = openShareModal;
+  select('#shareClose').onclick = closeShareModal;
+  select('#shareCopyBtn').onclick = copyShareLink;
+  select('#shareFbBtn').onclick = shareToFacebook;
+  select('#shareNativeBtn').onclick = shareNativeOrInstagram;
+  select('#shareModal').addEventListener('mousedown', event => {
+    if (event.target.id === 'shareModal') closeShareModal();
+  });
   select('#playBtn').onclick = () => (isPlaying ? stopSlideshow() : playSlideshow());
   select('#fsBtn').onclick = () => (
     document.fullscreenElement ? document.exitFullscreen() : lightboxEl.requestFullscreen?.()
@@ -360,9 +750,22 @@ export function initLightboxEvents() {
   select('#tagModal').addEventListener('mousedown', event => {
     if (event.target.id === 'tagModal') closeTagModal();
   });
+  tagInputAutocomplete = attachTagAutocomplete({
+    inputEl: select('#tagInput'),
+    listEl: select('#tagInputSuggest'),
+    getExcludedTags: () => [...stagedManualTags, ...stagedAiTags],
+    onEnter: submitTags,
+    onEscape: closeTagModal,
+  });
+  select('#pendingClose').onclick = closePendingModal;
+  select('#pendingModal').addEventListener('mousedown', event => {
+    if (event.target.id === 'pendingModal') closePendingModal();
+  });
   select('#eSave').onclick = saveEdit;
   select('#delBtn').onclick = deleteCurrentPhoto;
-  stageImage.onclick = () => select('#sbox').classList.toggle('zoom');
+  const stageBox = select('#sbox');
+  const swipePrevBar = select('#swipePrev');
+  const swipeNextBar = select('#swipeNext');
 
   let hideChromeTimer = null;
   lightboxEl.addEventListener('mousemove', () => {
@@ -373,13 +776,127 @@ export function initLightboxEvents() {
     }
   });
 
-  // Touch swipe navigation on mobile/tablet
+  // Pull-to-swipe buffer zone on mobile/tablet:
+  // - Shows a translucent side bar that grows as you drag until it hits SWIPE_CONFIRM_PX ("confirmed").
+  // - When zoomed in (`.zoom`), only activates AFTER hitting the horizontal scroll edge of `#sbox`.
+  const SWIPE_DEADZONE_PX = 10;
+  const SWIPE_CONFIRM_PX = 90;
+  const SWIPE_BAR_MAX_WIDTH_PX = 84;
+
   let touchStartX = 0;
-  select('#sbox').addEventListener('touchstart', event => {
+  let touchStartY = 0;
+  let pullStartX = null;
+  let pullDirection = 0; // -1 = swipe right -> previous, +1 = swipe left -> next
+  let pullConfirmed = false;
+  let gestureLockedVertical = false;
+  let didSwipeDrag = false;
+
+  // Tapping (mobile) or clicking (desktop) the image toggles zoom; ignored if the user just dragged to swipe.
+  stageImage.onclick = () => {
+    if (didSwipeDrag) {
+      didSwipeDrag = false;
+      return;
+    }
+    stageBox.classList.toggle('zoom');
+  };
+
+  const resetSwipeBars = () => {
+    for (const bar of [swipePrevBar, swipeNextBar]) {
+      if (!bar) continue;
+      bar.classList.remove('active', 'ready');
+      bar.style.width = '0px';
+      bar.style.opacity = '0';
+    }
+    pullStartX = null;
+    pullDirection = 0;
+    pullConfirmed = false;
+    gestureLockedVertical = false;
+  };
+
+  stageBox.addEventListener('touchstart', event => {
+    resetSwipeBars();
+    didSwipeDrag = false;
+    if (event.touches.length !== 1) return;
     touchStartX = event.touches[0].clientX;
+    touchStartY = event.touches[0].clientY;
   }, { passive: true });
-  select('#sbox').addEventListener('touchend', event => {
-    const deltaX = event.changedTouches[0].clientX - touchStartX;
-    if (Math.abs(deltaX) > 50) goSlide(deltaX < 0 ? 1 : -1);
-  });
+
+  stageBox.addEventListener('touchmove', event => {
+    if (event.touches.length !== 1) {
+      resetSwipeBars();
+      return;
+    }
+    const currentX = event.touches[0].clientX;
+    const currentY = event.touches[0].clientY;
+    const totalDx = currentX - touchStartX;
+    const totalDy = currentY - touchStartY;
+
+    if (pullStartX === null) {
+      if (gestureLockedVertical) return;
+      if (Math.abs(totalDy) > SWIPE_DEADZONE_PX && Math.abs(totalDy) > Math.abs(totalDx) * 1.15) {
+        gestureLockedVertical = true;
+        return;
+      }
+      if (Math.abs(totalDx) < SWIPE_DEADZONE_PX) return;
+
+      const intendedDir = totalDx < 0 ? 1 : -1; // dragging left -> next (+1), dragging right -> prev (-1)
+      const isZoomed = stageBox.classList.contains('zoom');
+      const maxScrollLeft = Math.max(0, stageBox.scrollWidth - stageBox.clientWidth);
+
+      // When zoomed in, allow natural horizontal panning until the image hits its horizontal scroll edge.
+      if (isZoomed && maxScrollLeft > 2) {
+        const atRightEdge = stageBox.scrollLeft >= maxScrollLeft - 2;
+        const atLeftEdge = stageBox.scrollLeft <= 2;
+        if (intendedDir === 1 && !atRightEdge) return;
+        if (intendedDir === -1 && !atLeftEdge) return;
+        pullDirection = intendedDir;
+        pullStartX = currentX;
+      } else {
+        pullDirection = intendedDir;
+        // Anchor just past the deadzone so pullDistance is already > 0 on the very first active frame.
+        pullStartX = touchStartX + (intendedDir === 1 ? -SWIPE_DEADZONE_PX : SWIPE_DEADZONE_PX);
+      }
+    }
+
+    // Track pull distance from the point where the buffer zone engaged.
+    const pullDistance = pullDirection === 1
+      ? (pullStartX - currentX)
+      : (currentX - pullStartX);
+
+    // Strictly `< 0` (not `<= 0`) so the boundary frame where pullStartX === currentX does not immediately reset!
+    if (pullDistance < 0) {
+      resetSwipeBars();
+      return;
+    }
+
+    didSwipeDrag = true;
+    if (event.cancelable) event.preventDefault();
+    const progress = Math.min(1, pullDistance / SWIPE_CONFIRM_PX);
+    const activeBar = pullDirection === 1 ? swipeNextBar : swipePrevBar;
+    const otherBar = pullDirection === 1 ? swipePrevBar : swipeNextBar;
+    if (otherBar) {
+      otherBar.classList.remove('active', 'ready');
+      otherBar.style.width = '0px';
+      otherBar.style.opacity = '0';
+    }
+    if (activeBar) {
+      activeBar.classList.add('active');
+      activeBar.style.width = Math.max(8, Math.round(progress * SWIPE_BAR_MAX_WIDTH_PX)) + 'px';
+      activeBar.style.opacity = (0.22 + progress * 0.72).toFixed(2);
+      const nowConfirmed = progress >= 1;
+      activeBar.classList.toggle('ready', nowConfirmed);
+      if (nowConfirmed && !pullConfirmed && typeof navigator.vibrate === 'function') {
+        navigator.vibrate(12);
+      }
+      pullConfirmed = nowConfirmed;
+    }
+  }, { passive: false });
+
+  const finishSwipe = () => {
+    const shouldGo = pullConfirmed ? pullDirection : 0;
+    resetSwipeBars();
+    if (shouldGo !== 0) goSlide(shouldGo);
+  };
+  stageBox.addEventListener('touchend', finishSwipe);
+  stageBox.addEventListener('touchcancel', resetSwipeBars);
 }

@@ -44,6 +44,45 @@ def make_thumbnail(source: Path, destination: Path, longest_edge_px: int, qualit
     destination.with_suffix('.tmp').replace(destination)
 
 
+def generate_thumbnails(longest_edge_px: int = 480, quality: int = 80, force: bool = False) -> tuple[int, int, str]:
+    """Generate missing thumbnails and update photos.json under INDEX_LOCK; returns `(made_count, failed_count, log_text)`.
+
+    Safe to call both from the standalone CLI and in-process from `gloan/thumbtool.py` (so server-triggered
+    runs share the exact same `INDEX_LOCK` as Flask request handlers).
+    """
+    longest_edge_px = max(64, min(2048, int(longest_edge_px)))
+    quality = max(10, min(95, int(quality)))
+    THUMB_DIR.mkdir(parents=True, exist_ok=True)
+    made: dict[str, str] = {}  # photo id -> tile file name
+    failed = 0
+    lines: list[str] = []
+    rows = available_rows()  # rows whose original file is missing are skipped, as on the website
+    lines.append(f'Data folder: {DATA}; {len(rows)} photo(s) with files')
+    for row in rows:
+        if thumb_path(row) and not force:
+            continue
+        name = f'{row["id"]}.jpg'
+        try:
+            make_thumbnail(PHOTO_DIR / f'{row["id"]}.{row["ext"]}', THUMB_DIR / name, longest_edge_px, quality)
+        except Exception as error:  # noqa: BLE001  one corrupt image must not stop the whole run
+            failed += 1
+            lines.append(f'FAILED {row["id"]}: {error}')
+        else:
+            made[row['id']] = name
+            lines.append(f'made   {name}')
+
+    if made:
+        # Re-read the index right before writing under INDEX_LOCK so concurrent edits are never lost.
+        with INDEX_LOCK:
+            fresh_rows = load_index()
+            for row in fresh_rows:
+                if row['id'] in made:
+                    row['thumb'] = made[row['id']]
+            save_index(fresh_rows)
+    lines.append(f'Done: {len(made)} made, {failed} failed')
+    return len(made), failed, '\n'.join(lines)
+
+
 def main() -> int:
     """Process every photo that needs a tile; return a process exit code (0 = no failures)."""
     parser = argparse.ArgumentParser(description='Generate gallery tile thumbnails')
@@ -51,34 +90,8 @@ def main() -> int:
     parser.add_argument('--quality', type=int, default=80, help='JPEG quality 1-95 (default 80)')
     parser.add_argument('--force', action='store_true', help='regenerate tiles that already exist')
     args = parser.parse_args()
-
-    THUMB_DIR.mkdir(parents=True, exist_ok=True)
-    made: dict[str, str] = {}  # photo id -> tile file name
-    failed = 0
-    rows = available_rows()  # rows whose original file is missing are skipped, as on the website
-    print(f'Data folder: {DATA}; {len(rows)} photo(s) with files')
-    for row in rows:
-        if thumb_path(row) and not args.force:
-            continue
-        name = f'{row["id"]}.jpg'
-        try:
-            make_thumbnail(PHOTO_DIR / f'{row["id"]}.{row["ext"]}', THUMB_DIR / name, args.size, args.quality)
-        except Exception as error:  # noqa: BLE001  one corrupt image must not stop the whole run
-            failed += 1
-            print(f'FAILED {row["id"]}: {error}')
-        else:
-            made[row['id']] = name
-            print(f'made   {name}')
-
-    if made:
-        # Re-read the index right before writing so edits made by the server during the run are not lost.
-        with INDEX_LOCK:
-            fresh_rows = load_index()
-            for row in fresh_rows:
-                if row['id'] in made:
-                    row['thumb'] = made[row['id']]
-            save_index(fresh_rows)
-    print(f'Done: {len(made)} made, {failed} failed')
+    _, failed, output = generate_thumbnails(args.size, args.quality, args.force)
+    print(output)
     return 1 if failed else 0
 
 

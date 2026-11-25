@@ -23,8 +23,8 @@ Stop the server with `Ctrl+C`; the password is asked for again next start.
 To skip the prompt, set `GLOAN_PASSWORD` in the environment (from a password
 manager, for example) before starting.
 
-Flags: `--host 0.0.0.0` to listen on your network, `--port N`.
-Env: `GLOAN_DATA` moves the storage folder (default `./data`).
+Flags: `--host 0.0.0.0` to listen on your network, `--port N`, `--ssl-cert PATH` + `--ssl-key PATH` to serve HTTPS directly, `--https-redirect` to redirect `http://` to `https://` behind a trusted proxy.
+Env: `GLOAN_DATA` moves the storage folder (default `./data`); `GLOAN_SSL_CERT` / `GLOAN_SSL_KEY` enable direct HTTPS; `GLOAN_HTTPS_REDIRECT=1` enables proxy HTTP→HTTPS redirect.
 
 ## Who can log in
 
@@ -62,11 +62,11 @@ The search box above the tag chips filters the gallery live and suggests tags as
   matches `bryce_winter` and `arches_winter`; `*winter, bryce` matches only `bryce_winter`); and from 3 characters on,
   one typo is forgiven.
 
-## Putting it online
+## Putting it online & HTTPS
 
-The server speaks plain HTTP. Put it behind a TLS reverse proxy (Caddy, nginx,
-Cloudflare Tunnel) before exposing it, or the password and token cross the
-network in the clear.
+- **Cloud Run (production):** Cloud Run terminates HTTPS automatically, and `deploy.sh` passes `--https-redirect` so plain `http://` visits are redirected to `https://`.
+- **Direct HTTPS (local LAN or self-hosted):** Pass `--ssl-cert certs/cert.pem --ssl-key certs/key.pem` (or set `GLOAN_SSL_CERT` and `GLOAN_SSL_KEY`) to serve TLS directly from Gunicorn/Werkzeug. Keep `certs/` out of Git (already in `.gitignore` and `.dockerignore`).
+- **Reverse proxy:** You can also run plain HTTP behind Caddy, nginx, or Cloudflare Tunnel with `--proxy-header X-Forwarded-For --https-redirect`.
 
 ## API
 
@@ -74,17 +74,23 @@ network in the clear.
 |---|---|---|
 | GET | `/api/photos?page=0&size=10&sort=new&tags=a,b&match=any` (one page of photos, each with `added` ms timestamp and `size` bytes, plus `total`, `all`, `pages` and gallery-wide `tags` counts; `size` max 100; `sort` is `new`, `old`, `az`, `za`, `big` or `small`; `match` is `any` or `all`), `/photos/<id>.<ext>`, `/api/session` | public |
 | GET | `/api/tags?q=text&limit=8` (tag suggestions, best first: `[{tag, count, match}]` where `match` is `exact`, `prefix`, `word`, `contains`, `wildcard`, `fuzzy` or `popular`; `limit` max 20) | public |
-| POST | `/api/passkey/login/options`, `/api/passkey/login` (WebAuthn Passkey assertion + Turnstile `captchaToken`) -> `{"token"}` | public (5 failures = 60s lockout) |
-| POST | `/api/passkey/register/options`, `/api/passkey/register` (appends ES256 public key to `data/passkey.json`) | owner (or first-time setup when no passkey exists) |
+| POST | `/api/passkey/login/options`, `/api/passkey/login` (WebAuthn Passkey assertion + Turnstile `captchaToken`) -> sets `HttpOnly; Secure; SameSite=Strict` `gloan_session` cookie + `{"ok":true,"csrfToken"}` | public (5 failures = 60s lockout) |
+| POST | `/api/logout` (clears `gloan_session` cookie) | cookie + `X-CSRF-Token` |
+| POST | `/api/passkey/register/options`, `/api/passkey/register` (appends ES256 public key to `data/passkey.json`, sets session cookie) | owner (or first-time setup when no passkey exists) |
 | GET | `/thumbs/<id>.jpg` | public |
 | GET | `/api/thumbnails` (job status: `running`, `exitCode`, `output`, `missing`) | owner |
 | POST | `/api/thumbnails` (starts `tools/make_thumbnails.py` in the background) | owner |
+| GET | `/api/photos/<id>` (single photo metadata for shared `/?photo=<id>` URLs) | public |
 | POST | `/api/rescan` (adopts manually copied images from `data/photos/` and runs the AI tag bot on any photo missing `aiTags`) -> `{"added","aiTagged","skipped","indexed"}` | owner |
+| DELETE | `/api/aitags` (clears all AI-generated `aiTags` from `photos.json` while keeping manual `tags`) -> `{"cleared"}` | owner |
 | POST | `/api/photos` raw image body, `X-Title` / `X-Tags` URL-encoded headers (automatically adds 5+ AI tags and records `aiTags` in `photos.json`) | owner |
-| PATCH | `/api/photos/<id>` `{"title","tags","story"}` | owner |
+| PATCH | `/api/photos/<id>` `{"title","tags","story","aiTags"}` (add or delete manual and AI tags) | owner |
+| POST | `/api/photos/<id>/suggest-tags` `{"tags":[...]}` (submits visitor tag suggestions into hidden `pendingTags` queue for admin review) | public (rate-limited) |
+| GET | `/api/tag-suggestions` (lists all photos with pending visitor tag suggestions) | owner |
+| POST | `/api/photos/<id>/pending-tags` `{"tag","action":"accept"|"reject"}` (approves or rejects pending visitor tags) | owner |
 | DELETE | `/api/photos/<id>` | owner |
 
-Owner calls send `Authorization: Bearer <token>`; tokens last 12 hours.
+Owner browser sessions use an `HttpOnly; Secure; SameSite=Strict` `gloan_session` cookie plus an HMAC-bound `X-CSRF-Token` header on mutating requests (tokens last 12 hours and are never stored in `localStorage`).
 
 ## Deploying to Google Cloud Run
 

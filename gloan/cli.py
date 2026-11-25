@@ -4,7 +4,9 @@ import argparse
 import contextlib
 import logging
 import os
+from pathlib import Path
 import signal
+import ssl
 from typing import Any
 
 from werkzeug.serving import make_server
@@ -20,7 +22,45 @@ def stop_on_sigterm(signum: int, frame: Any) -> None:
     raise KeyboardInterrupt
 
 
-def _run_with_gunicorn(host: str, port: int) -> bool:
+def resolve_ssl_files(
+    cert_path: str | None,
+    key_path: str | None,
+    auto_dirs: tuple[Path, ...] = (),
+) -> tuple[str, str] | None:
+    """Validate optional TLS certificate and private key paths for direct HTTPS serving.
+
+    Returns ``(cert_path, key_path)`` when both are configured and exist on disk, ``None`` when neither
+    is set (plain HTTP), or raises ``ValueError`` for partial/missing explicit configuration.
+    When neither explicit path is set and ``auto_dirs`` is provided, checks each directory for a matching
+    ``cert.pem`` + ``key.pem`` pair (used by local Docker debug so F5 enables HTTPS automatically when certs exist).
+    """
+    cert = (cert_path or '').strip()
+    key = (key_path or '').strip()
+    if not cert and not key:
+        for directory in auto_dirs:
+            auto_cert = directory / 'cert.pem'
+            auto_key = directory / 'key.pem'
+            if auto_cert.is_file() and auto_key.is_file():
+                return str(auto_cert), str(auto_key)
+        return None
+    if not cert or not key:
+        raise ValueError('Both --ssl-cert and --ssl-key (or GLOAN_SSL_CERT and GLOAN_SSL_KEY) must be set together')
+    if not Path(cert).is_file():
+        raise ValueError(f'SSL certificate file not found: {cert}')
+    if not Path(key).is_file():
+        raise ValueError(f'SSL private key file not found: {key}')
+    return cert, key
+
+
+def build_ssl_context(cert_path: str, key_path: str) -> ssl.SSLContext:
+    """Create a TLS 1.2+ server SSLContext (disabling legacy TLS 1.0/1.1) for direct HTTPS serving."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    return ctx
+
+
+def _run_with_gunicorn(host: str, port: int, ssl_files: tuple[str, str] | None = None) -> bool:
     """Run the Flask app under Gunicorn (1 worker, 8 threads) when Gunicorn is available on Unix.
 
     Why 1 worker: INDEX_LOCK, the login-failure map (FAILS), the thumbnail-job state and the in-memory caches
@@ -51,16 +91,30 @@ def _run_with_gunicorn(host: str, port: int) -> bool:
         def load(self) -> Any:
             return self.application
 
-    StandaloneGunicornApp(app, {
+    options: dict[str, Any] = {
         'bind': f'{host}:{port}',
         'workers': 1,
         'threads': 8,
         'timeout': 30,
+        'graceful_timeout': 15,
         'keepalive': 2,
         'max_requests': 1000,
         'max_requests_jitter': 100,
+        'limit_request_line': 4096,
+        'limit_request_fields': 64,
+        'limit_request_field_size': 8190,
         'accesslog': '-',
-    }).run()
+    }
+    if ssl_files:
+        options['certfile'], options['keyfile'] = ssl_files
+
+        def _tls12_ssl_context(_conf: Any, default_factory: Any) -> ssl.SSLContext:
+            context = default_factory()
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            return context
+
+        options['ssl_context'] = _tls12_ssl_context
+    StandaloneGunicornApp(app, options).run()
     return True
 
 
@@ -78,22 +132,38 @@ def main() -> None:
     parser.add_argument('--proxy-any-peer', action='store_true',
                         help='trust the proxy header from any peer, not just loopback (only if the container is '
                              'reachable solely through a managed proxy such as Cloud Run)')
+    parser.add_argument('--ssl-cert', default=os.environ.get('GLOAN_SSL_CERT', '').strip() or None, metavar='PATH',
+                        help='path to a PEM TLS certificate file to serve HTTPS directly (also GLOAN_SSL_CERT)')
+    parser.add_argument('--ssl-key', default=os.environ.get('GLOAN_SSL_KEY', '').strip() or None, metavar='PATH',
+                        help='path to the matching PEM TLS private key file (also GLOAN_SSL_KEY)')
+    parser.add_argument('--https-redirect', action='store_true',
+                        default=os.environ.get('GLOAN_HTTPS_REDIRECT', '').strip().lower() in ('1', 'true', 'yes'),
+                        help='redirect plain-HTTP requests to HTTPS when a trusted proxy sends X-Forwarded-Proto: http')
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+
+    auto_ssl_dirs = (Path('/certs'), Path('certs')) if os.environ.get('GLOAN_SSL_AUTO', '').strip().lower() in ('1', 'true', 'yes') else ()
+    try:
+        ssl_files = resolve_ssl_files(args.ssl_cert, args.ssl_key, auto_dirs=auto_ssl_dirs)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     Handler.proxy_header = args.proxy_header
     Handler.proxy_hops = max(1, args.proxy_hops)
     Handler.proxy_any_peer = args.proxy_any_peer
+    Handler.https_redirect = args.https_redirect
     Handler.auth = Auth()
     PHOTO_DIR.mkdir(parents=True, exist_ok=True)
     adopted = scan_folder()
     if adopted:
         LOGGER.info('Added %d photo(s) found in %s', adopted, PHOTO_DIR)
 
-    LOGGER.info('Gloan on http://%s:%s (data: %s)', args.host, args.port, DATA)
+    scheme = 'https' if ssl_files else 'http'
+    LOGGER.info('Gloan on %s://%s:%s (data: %s)', scheme, args.host, args.port, DATA)
 
-    if not _run_with_gunicorn(args.host, args.port):
-        server = make_server(args.host, args.port, app, threaded=True)
+    if not _run_with_gunicorn(args.host, args.port, ssl_files=ssl_files):
+        ssl_ctx = build_ssl_context(ssl_files[0], ssl_files[1]) if ssl_files else None
+        server = make_server(args.host, args.port, app, threaded=True, ssl_context=ssl_ctx)
         signal.signal(signal.SIGTERM, stop_on_sigterm)
         with contextlib.suppress(KeyboardInterrupt):
             server.serve_forever()

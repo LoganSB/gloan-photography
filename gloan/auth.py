@@ -55,8 +55,8 @@ def b64url_encode(raw: bytes) -> str:
 
 
 def b64url_decode(encoded: str) -> bytes:
-    """Decode an unpadded or padded base64url string into bytes; raise ValueError on malformed input."""
-    if not isinstance(encoded, str) or not re.fullmatch(r'[A-Za-z0-9_-]+=*', encoded.strip()):
+    """Decode an unpadded or standard-padded base64url string into bytes; raise ValueError on malformed input."""
+    if not isinstance(encoded, str) or not re.fullmatch(r'[A-Za-z0-9_-]+={0,2}', encoded.strip()):
         raise ValueError('invalid base64url encoding')
     cleaned = encoded.strip().rstrip('=')
     if len(cleaned) % 4 == 1:
@@ -110,7 +110,7 @@ def verify_turnstile(token: str, remote_ip: str = '') -> bool:
     req = Request(TURNSTILE_VERIFY_URL, data=payload, headers={'Content-Type': 'application/json'}, method='POST')
     try:
         with urlopen(req, timeout=5) as response:
-            body = json.loads(response.read())
+            body = json.loads(response.read(65536))
             return bool(body.get('success'))
     except (URLError, ValueError, OSError):
         return False
@@ -177,26 +177,79 @@ def load_passkeys() -> list[dict[str, Any]]:
         return [dict(item) for item in _cached_passkeys]
 
 
+def _write_private_file_atomic(target: Any, payload: bytes) -> None:
+    """Atomically write a sensitive file with 0o600 permissions from creation (eliminating chmod TOCTOU races)."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix('.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(payload)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(target)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def save_passkeys(records: list[dict[str, Any]]) -> None:
     """Atomically persist the list of registered owner passkeys to `data/passkey.json` and update the cache."""
     global _passkey_generation, _cached_passkey_stamp, _cached_passkeys  # pylint: disable=global-statement
     bounded = [dict(item) for item in records[:MAX_PASSKEYS]]
     with _passkey_lock:
-        PASSKEY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = PASSKEY_FILE.with_suffix('.tmp')
-        tmp.write_text(json.dumps({'credentials': bounded}, indent=2), encoding='utf-8')
-        tmp.replace(PASSKEY_FILE)
+        payload = json.dumps({'credentials': bounded}, indent=2).encode('utf-8')
+        _write_private_file_atomic(PASSKEY_FILE, payload)
         _passkey_generation += 1
         _cached_passkeys = bounded
         _cached_passkey_stamp = (_passkey_generation, *_passkey_file_stamp())
 
 
+def validate_host_header(raw_host: str) -> str:
+    """Validate an HTTP Host header (`hostname` or `hostname:port`) and optional GLOAN_ALLOWED_HOSTS allowlist.
+
+    Prevents Host-header open redirects, Open Graph URL poisoning, and malformed WebAuthn rpIds.
+    """
+    cleaned = (raw_host or '').strip().lower()
+    if not cleaned or any(bad in cleaned for bad in ('/', '\\', '@', ' ', '\t', '\r', '\n', '?')):
+        raise ValueError('invalid host header')
+    if ':' in cleaned:
+        hostname, port_str = cleaned.rsplit(':', 1)
+        if not port_str.isdigit() or not (1 <= int(port_str) <= 65535):
+            raise ValueError('invalid host port')
+        normalized = f'{hostname}:{int(port_str)}'
+    else:
+        hostname = cleaned
+        normalized = hostname
+    if not hostname or not RP_ID_RE.fullmatch(hostname) or '..' in hostname or hostname.startswith('.') or hostname.endswith('.'):
+        raise ValueError('invalid host header')
+    allowed_raw = os.environ.get('GLOAN_ALLOWED_HOSTS', '').strip()
+    if allowed_raw:
+        allowed_hosts = [item.strip().lower() for item in allowed_raw.split(',') if item.strip()]
+        matched = False
+        for pattern in allowed_hosts:
+            if pattern.startswith('*.'):
+                suffix = pattern[1:]  # e.g. ".run.app"
+                if hostname.endswith(suffix) and len(hostname) > len(suffix):
+                    matched = True
+                    break
+            elif hostname == pattern or normalized == pattern:
+                matched = True
+                break
+        if not matched:
+            raise ValueError('host not in GLOAN_ALLOWED_HOSTS')
+    return normalized
+
+
 def validate_rp_id(raw_host: str) -> str:
     """Extract and validate the WebAuthn Relying Party ID (hostname without port) from the HTTP Host header."""
-    rp_id = (raw_host or 'localhost').split(':', 1)[0].strip().lower()
-    if not rp_id or not RP_ID_RE.fullmatch(rp_id) or '..' in rp_id:
-        raise ValueError('invalid host header for WebAuthn rpId')
-    return rp_id
+    normalized = validate_host_header(raw_host or 'localhost')
+    return normalized.split(':', 1)[0]
 
 
 def has_passkey() -> bool:
@@ -308,6 +361,7 @@ def register_passkey_credential(payload: dict[str, Any], expected_host: str) -> 
     raw_cred_id = b64url_decode(credential_id)
     if not 1 <= len(raw_cred_id) <= 1024:
         raise ValueError('invalid credentialId length')
+    canonical_cred_id = b64url_encode(raw_cred_id)
     spki_bytes = b64url_decode(public_key_spki_b64)
     try:
         pub_key = load_der_public_key(spki_bytes)
@@ -317,19 +371,28 @@ def register_passkey_credential(payload: dict[str, Any], expected_host: str) -> 
         raise ValueError('passkey must use an ES256 (P-256) public key')
     canonical_spki_b64 = b64url_encode(pub_key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo))
 
-    _, _, sign_count = _verify_client_data_and_auth_data(
+    _, auth_data_bytes, sign_count = _verify_client_data_and_auth_data(
         client_data_b64, auth_data_b64, 'webauthn.create', 'register', expected_host
     )
+    # Per W3C WebAuthn §6.1, registration authenticatorData MUST carry AT (bit 0x40) with matching credentialId.
+    if not (auth_data_bytes[32] & 0x40) or len(auth_data_bytes) < 55:
+        raise ValueError('missing attested credential data in authenticatorData')
+    attested_cred_len = struct.unpack('>H', auth_data_bytes[53:55])[0]
+    if len(auth_data_bytes) < 55 + attested_cred_len:
+        raise ValueError('truncated attested credential data')
+    if not hmac.compare_digest(auth_data_bytes[55:55 + attested_cred_len], raw_cred_id):
+        raise ValueError('attested credentialId mismatch')
+
     existing = load_passkeys()
-    if len(existing) >= MAX_PASSKEYS and not any(item['credentialId'] == credential_id for item in existing):
+    if len(existing) >= MAX_PASSKEYS and not any(item['credentialId'] == canonical_cred_id for item in existing):
         raise ValueError(f'maximum of {MAX_PASSKEYS} passkeys reached')
     record = {
-        'credentialId': credential_id,
+        'credentialId': canonical_cred_id,
         'publicKeySpki': canonical_spki_b64,
         'signCount': sign_count,
         'created': int(time.time() * 1000),
     }
-    updated = [item for item in existing if item['credentialId'] != credential_id]
+    updated = [item for item in existing if item['credentialId'] != canonical_cred_id]
     updated.append(record)
     save_passkeys(updated)
     return record
@@ -390,9 +453,7 @@ def _load_or_create_session_secret() -> bytes:
         pass
     secret = secrets.token_bytes(32)
     try:
-        SESSION_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SESSION_KEY_FILE.write_bytes(secret)
-        os.chmod(SESSION_KEY_FILE, 0o600)
+        _write_private_file_atomic(SESSION_KEY_FILE, secret)
     except OSError:
         pass
     return secret
@@ -413,13 +474,25 @@ class Auth:
         payload = str(int(time.time()) + TOKEN_TTL).encode('ascii')
         return base64.urlsafe_b64encode(payload).decode('ascii') + '.' + self._sig(payload)
 
+    def csrf_token(self, session_token: str) -> str:
+        """Derive a stateless, session-bound CSRF token via HMAC-SHA256 (unforgeable without the HttpOnly cookie)."""
+        return hmac.new(self.key, b'csrf:' + session_token.encode('ascii'), hashlib.sha256).hexdigest()
+
+    def verify_csrf(self, session_token: str, candidate: str) -> bool:
+        """Constant-time verification that `candidate` matches the CSRF token bound to `session_token`."""
+        if not isinstance(candidate, str) or len(candidate) != 64:
+            return False
+        return hmac.compare_digest(candidate, self.csrf_token(session_token))
+
     def verify(self, token: str) -> bool:
-        """True when the token's signature matches and it has not expired."""
+        """True when the token's canonical encoding and HMAC signature match and it has not expired."""
         if not isinstance(token, str) or len(token) > 256 or '.' not in token:
             return False
         try:
             b64, sig = token.split('.', 1)
-            payload = base64.urlsafe_b64decode(b64.encode('ascii'))
+            if len(sig) != 64 or not re.fullmatch(r'[0-9a-f]{64}', sig):
+                return False
+            payload = b64url_decode(b64)
             ok = hmac.compare_digest(sig, self._sig(payload)) and int(payload) > time.time()
         except (ValueError, TypeError):
             ok = False

@@ -2,8 +2,9 @@
  * Photo upload staging modal, client-side canvas downscaling, drag-and-drop and procedural demo images.
  */
 
-import { API, createElement, escapeHtml, isOwner, parseTags, select, toast, withBusy } from './api.js';
+import { API, createElement, escapeHtml, isOwner, parseTags, select, setOverlayOpen, toast, withBusy } from './api.js';
 import { refresh, state, suggestionChips } from './gallery.js';
+import { attachTagAutocomplete } from './search.js';
 
 let stagedFiles = [];
 
@@ -11,7 +12,7 @@ let stagedFiles = [];
  * Open the upload modal and render any currently staged files.
  */
 export function openUpload() {
-  select('#upModal').classList.add('open');
+  setOverlayOpen('#upModal', true);
   renderStaged();
 }
 
@@ -19,7 +20,7 @@ export function openUpload() {
  * Close the upload modal and release all object-URL preview blobs.
  */
 export function closeUpload() {
-  select('#upModal').classList.remove('open');
+  setOverlayOpen('#upModal', false);
   stagedFiles.forEach(item => URL.revokeObjectURL(item.preview));
   stagedFiles = [];
   select('#allTags').value = '';
@@ -54,7 +55,7 @@ export function renderStaged() {
   stagedBox.innerHTML = '';
   stagedFiles.forEach(item => {
     const row = createElement('div', 'stage');
-    row.innerHTML = `<img src="${item.preview}"><div class="f"><input class="field" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" value="${escapeHtml(item.title)}" placeholder="Title"><input class="field" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" value="${escapeHtml(item.tags)}" placeholder="Tags for this photo (optional)"></div>`;
+    row.innerHTML = `<img src="${escapeHtml(item.preview)}"><div class="f"><input class="field" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" value="${escapeHtml(item.title)}" placeholder="Title"><input class="field" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" value="${escapeHtml(item.tags)}" placeholder="Tags for this photo (optional)"></div>`;
     const [titleInput, tagsInput] = row.querySelectorAll('input');
     titleInput.oninput = () => { item.title = titleInput.value; };
     tagsInput.oninput = () => { item.tags = tagsInput.value; };
@@ -305,6 +306,10 @@ export function initUploadEvents() {
   });
   select('#upModal').addEventListener('mousedown', event => {
     if (event.target.id === 'upModal') closeUpload();
+  });
+  attachTagAutocomplete({
+    inputEl: select('#allTags'),
+    listEl: select('#allTagsSuggest'),
   });
 
   // Page-wide drag & drop upload for logged-in owner

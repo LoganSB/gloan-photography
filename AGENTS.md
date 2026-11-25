@@ -9,7 +9,11 @@ Read this file and [SYSTEMS.md](SYSTEMS.md) before changing anything.
 3. **Efficiency vs. readability.** Prefer efficient solutions, but readability is weighted heavily. Don't use a clever or obscure approach for a marginal speedup. If you do, comment why.
 4. **Keep it simple.** The web server uses Flask + Gunicorn (`requirements.txt`); Pillow is used only by `tools/make_thumbnails.py`; the frontend is `index.html` + `static/app.css` + native ES modules in `static/*.js` (no bundler or build step). Do not add dependencies or build steps without asking the user.
 5. **Match existing style** in the file you edit. Don't reformat unrelated code.
-6. **Use Git Branches** for Significant changes or new features. Avoid directly modifying while on origin main except for small changes.
+6. **Always create a new Git branch before working when `main` is checked out.**
+   - Before editing any files for a new feature, UI/design change, refactor, or multi-file fix, run `git branch --show-current`.
+   - If the current branch is `main` (or `master`), **immediately create and check out a descriptive new branch** (e.g. `git checkout -b feature/<short-name>` or `git checkout -b fix/<short-name>`) *before* making any file edits.
+   - If the command sandbox blocks writing to `.git` (read-only filesystem), run `git checkout -b <branch>` outside the sandbox (or ask the user to approve/run it) **before** editing code — never silently fall back to editing directly on `main`.
+   - The only exceptions are tiny single-line/doc-only edits or when the user explicitly says to edit directly on `main`.
 7. **No emojis without asking.** Do not use emojis or decorative icon symbols in UI text, buttons, badges, or messages — only the slideshow play/pause symbol (`▶` / `❚❚`) is permitted. Whenever adding or changing UI text where an emoji might be used, prompt the user first to ask whether they want an emoji or plain text.
 
 ## Tool & language review (every request)

@@ -19,6 +19,20 @@ export function select(selector) {
 }
 
 /**
+ * Open or close a modal/lightbox overlay and lock background page scrolling
+ * whenever at least one `.modal.open` or `.lb.open` overlay is visible.
+ * Centralizing this prevents nested modals (e.g. Share/Tags over Lightbox) from unlocking scroll early.
+ */
+export function setOverlayOpen(overlayOrSelector, isOpen) {
+  const overlayEl = typeof overlayOrSelector === 'string' ? select(overlayOrSelector) : overlayOrSelector;
+  if (!overlayEl) return;
+  overlayEl.classList.toggle('open', Boolean(isOpen));
+  const anyOverlayOpen = Boolean(document.querySelector('.modal.open, .lb.open'));
+  document.documentElement.classList.toggle('scroll-locked', anyOverlayOpen);
+  document.body.classList.toggle('scroll-locked', anyOverlayOpen);
+}
+
+/**
  * Create a DOM element with optional className and innerHTML.
  */
 export function createElement(tagName, className, innerHtml) {
@@ -101,28 +115,107 @@ export function setOwner(enabled, shouldRender = true) {
   select('#authBtn').innerHTML = enabled
     ? '<span class="lbl">Log out</span>'
     : '<span class="lbl">Admin login</span>';
+  const tagBtn = select('#addTagBtn');
+  if (tagBtn) tagBtn.textContent = enabled ? 'Tags' : 'Suggest tags';
   if (shouldRender && onOwnerChangedCallback) {
     onOwnerChangedCallback();
   }
 }
 
+let configuredTurnstileSiteKey = '';
+let turnstileScriptPromise = null;
+
 /**
- * Backend API wrapper handling bearer token attachment and 401 session expiry recovery.
+ * Store the server's configured Cloudflare Turnstile site key (empty string when CAPTCHA is disabled).
+ */
+export function setTurnstileSiteKey(siteKey) {
+  configuredTurnstileSiteKey = String(siteKey || '').trim();
+}
+
+/**
+ * Create a reusable Cloudflare Turnstile widget controller for `boxSelector`.
+ * Shared by the Admin login modal (`#turnstileBox`) and public visitor tag suggestions (`#tagTurnstileBox`).
+ */
+export function createTurnstileController(boxSelector) {
+  let widgetId = null;
+  let token = '';
+
+  const loadScript = () => {
+    if (window.turnstile) return Promise.resolve();
+    if (!turnstileScriptPromise) {
+      turnstileScriptPromise = new Promise(resolve => {
+        const existing = select('#turnstileScript');
+        if (existing) {
+          existing.addEventListener('load', resolve, { once: true });
+          return;
+        }
+        const script = document.createElement('script');
+        script.id = 'turnstileScript';
+        script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+        script.async = true;
+        script.onload = resolve;
+        document.head.append(script);
+      });
+    }
+    return turnstileScriptPromise;
+  };
+
+  return {
+    getToken: () => token,
+    isRequired: () => Boolean(configuredTurnstileSiteKey),
+    hide() {
+      const box = select(boxSelector);
+      if (box) box.style.display = 'none';
+      token = '';
+    },
+    reset() {
+      token = '';
+      if (window.turnstile && widgetId !== null) {
+        window.turnstile.reset(widgetId);
+      }
+    },
+    async ensure() {
+      const box = select(boxSelector);
+      if (!box) return;
+      if (!configuredTurnstileSiteKey) {
+        box.style.display = 'none';
+        return;
+      }
+      box.style.display = 'flex';
+      await loadScript();
+      if (!window.turnstile) return;
+      if (widgetId !== null) {
+        token = '';
+        window.turnstile.reset(widgetId);
+        return;
+      }
+      widgetId = window.turnstile.render(box, {
+        sitekey: configuredTurnstileSiteKey,
+        callback: nextToken => { token = nextToken; },
+        'expired-callback': () => { token = ''; },
+      });
+    },
+  };
+}
+
+// Clear any legacy localStorage token left over from earlier revisions before HttpOnly cookie sessions.
+try {
+  localStorage.removeItem('gloan-token');
+} catch (error) {
+  // Ignore storage restrictions in private browsing modes.
+}
+
+/**
+ * Backend API wrapper using HttpOnly SameSite=Strict session cookies + in-memory X-CSRF-Token header.
  */
 export const API = {
-  token: localStorage.getItem('gloan-token') || '',
+  csrfToken: '',
 
   /**
-   * Persist or clear the owner bearer token in localStorage.
+   * Store or clear the session-bound CSRF token in memory (never written to localStorage).
    */
-  setToken(tokenValue) {
-    this.token = tokenValue;
-    try {
-      if (tokenValue) localStorage.setItem('gloan-token', tokenValue);
-      else localStorage.removeItem('gloan-token');
-    } catch (error) {
-      // Private browsing modes may block localStorage writes; in-memory token still works for this tab.
-    }
+  setCsrfToken(tokenValue) {
+    this.csrfToken = String(tokenValue || '');
   },
 
   /**
@@ -130,11 +223,18 @@ export const API = {
    */
   async call(method, path, { body, headers } = {}) {
     const requestHeaders = { ...headers };
-    if (this.token) requestHeaders.Authorization = 'Bearer ' + this.token;
-    const response = await fetch(path, { method, headers: requestHeaders, body });
+    if (this.csrfToken && (method === 'POST' || method === 'PATCH' || method === 'DELETE')) {
+      requestHeaders['X-CSRF-Token'] = this.csrfToken;
+    }
+    const response = await fetch(path, {
+      method,
+      headers: requestHeaders,
+      body,
+      credentials: 'same-origin',
+    });
     const payload = await response.json().catch(() => ({}));
-    if (response.status === 401 && this.token && path !== '/api/login') {
-      this.setToken('');
+    if (response.status === 401 && isOwner() && !path.startsWith('/api/passkey/')) {
+      this.setCsrfToken('');
       setOwner(false);
       toast('Session expired — log in again');
     }
@@ -142,8 +242,20 @@ export const API = {
     return payload;
   },
 
+  logout() {
+    return this.call('POST', '/api/logout');
+  },
+
   list(query) {
     return this.call('GET', '/api/photos?' + new URLSearchParams(query));
+  },
+
+  getPhoto(photoId) {
+    return this.call('GET', '/api/photos/' + encodeURIComponent(photoId));
+  },
+
+  clearAiTags() {
+    return this.call('DELETE', '/api/aitags');
   },
 
   session() {
@@ -187,9 +299,29 @@ export const API = {
     });
   },
 
-  update(photoId, title, tags, story) {
+  update(photoId, title, tags, story, aiTags) {
+    const payload = { title, tags, story };
+    if (Array.isArray(aiTags)) payload.aiTags = aiTags;
     return this.call('PATCH', '/api/photos/' + photoId, {
-      body: JSON.stringify({ title, tags, story }),
+      body: JSON.stringify(payload),
+      headers: { 'Content-Type': 'application/json' },
+    });
+  },
+
+  suggestTags(photoId, tags, captchaToken = '') {
+    return this.call('POST', '/api/photos/' + encodeURIComponent(photoId) + '/suggest-tags', {
+      body: JSON.stringify({ tags, captchaToken }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+  },
+
+  listPendingTags() {
+    return this.call('GET', '/api/tag-suggestions');
+  },
+
+  moderatePendingTag(photoId, tag, action) {
+    return this.call('POST', '/api/photos/' + encodeURIComponent(photoId) + '/pending-tags', {
+      body: JSON.stringify({ tag, action }),
       headers: { 'Content-Type': 'application/json' },
     });
   },

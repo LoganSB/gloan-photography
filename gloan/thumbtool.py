@@ -1,28 +1,31 @@
-"""Runs tools/make_thumbnails.py on demand (owner request) as a separate process and reports its status."""
+"""Runs thumbnail generation on demand (owner request) in a background thread sharing INDEX_LOCK."""
 
-import subprocess
-import sys
+import importlib.util
 import threading
 
 from gloan.config import ROOT
 from gloan.storage import available_rows, bump_index_generation, thumb_path
 
 TOOL_PATH = ROOT / 'tools' / 'make_thumbnails.py'
-JOB_TIMEOUT_SECONDS = 1800  # a huge first run may take a while, but must not hang forever
 
 _state_lock = threading.Lock()  # guards _state across handler threads
 _state: dict = {'running': False, 'exitCode': None, 'output': ''}
 
 
 def _run_job() -> None:
-    """Thread body: run the tool to completion and record how it went."""
+    """Thread body: execute `tools/make_thumbnails.py:generate_thumbnails()` in-process so it shares INDEX_LOCK."""
     try:
-        # Fixed argument list, no shell: nothing from the request reaches the command line.
-        result = subprocess.run([sys.executable, str(TOOL_PATH)], cwd=ROOT, capture_output=True, text=True,
-                                timeout=JOB_TIMEOUT_SECONDS, check=False)
-        outcome = {'exitCode': result.returncode, 'output': (result.stdout + result.stderr)[-2000:]}
-    except (OSError, subprocess.TimeoutExpired) as error:
-        outcome = {'exitCode': -1, 'output': f'could not run the thumbnail tool: {error}'}
+        spec = importlib.util.spec_from_file_location('gloan_make_thumbnails', TOOL_PATH)
+        if spec is None or spec.loader is None:
+            raise RuntimeError('thumbnail tool module not found')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _, failed, output = module.generate_thumbnails()
+        outcome = {'exitCode': 1 if failed else 0, 'output': output[-2000:]}
+    except SystemExit as exc:
+        outcome = {'exitCode': 1, 'output': str(exc)[-2000:]}
+    except Exception as error:  # noqa: BLE001
+        outcome = {'exitCode': -1, 'output': f'could not run the thumbnail tool: {error}'[-2000:]}
     with _state_lock:
         _state.update(running=False, **outcome)
     bump_index_generation()
